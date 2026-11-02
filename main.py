@@ -16,16 +16,31 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 EXCHANGE_COMMISSION = 0.02  # 2% exchange commission
 
-# Tier-1 Tournament Whitelist
-TIER1_TOURNAMENTS = {
+# Complete Global T20 & 100-Ball Tournament Whitelist (Men's & Women's)
+GLOBAL_T20_LEAGUES = {
+    # International
+    "cricket_international_t20": "Men's International T20",
+    "cricket_international_t20_women": "Women's International T20",
+    
+    # India
     "cricket_ipl": "IPL (Indian Premier League)",
-    "cricket_international_t20": "International T20",
-    "cricket_odi": "One Day Internationals (ODI)",
-    "cricket_test_match": "Test Matches",
-    "cricket_big_bash": "Big Bash League (BBL)",
-    "cricket_psl": "Pakistan Super League (PSL)",
-    "cricket_caribbean_premier_league": "CPL",
-    "cricket_t20_blast": "Vitality T20 Blast"
+    "cricket_wpl": "WPL (Women's Premier League)",
+    
+    # Australia & New Zealand
+    "cricket_big_bash": "BBL (Big Bash League)",
+    "cricket_wbbl": "WBBL (Women's Big Bash)",
+    "cricket_super_smash": "Super Smash (Men & Women)",
+    
+    # South Africa, Pakistan, Americas
+    "cricket_sa20": "SA20 League",
+    "cricket_psl": "PSL (Pakistan Super League)",
+    "cricket_caribbean_premier_league": "CPL / WCPL",
+    "cricket_major_league_cricket": "MLC (Major League Cricket)",
+    
+    # UK
+    "cricket_t20_blast": "Vitality T20 Blast",
+    "cricket_the_hundred": "The Hundred (Men's)",
+    "cricket_the_hundred_women": "The Hundred (Women's)"
 }
 
 HEADERS = {
@@ -55,138 +70,152 @@ def calculate_cut_loss(back_stake: int, back_odds: float, current_lay_odds: floa
     salvaged = int(back_stake - loss)
     return int(lay_stake), loss, salvaged
 
-# ==========================================
-# 1. FREE LIVE SCORE ENGINE (ZERO API COST)
-# ==========================================
-def fetch_free_live_scores():
+# ===================================================
+# 1. EXPANDED FREE SCORE SCRAPER (ALL POPULAR T20S)
+# ===================================================
+def fetch_free_t20_scores():
     """
-    Fetches real-time scores directly from free public JSON endpoints without using API credits.
+    Scrapes live matches and filters for all Men's and Women's T20s & 100-ball games.
+    Explicitly excludes ODIs, Tests, and First-Class matches.
     """
     url = "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/current?lang=en"
-    matches = []
+    t20_matches = []
+    
+    # Identifiers for popular global T20 & 100-ball competitions
+    t20_keywords = [
+        "T20", "TWENTY20", "T20I", "WT20", "IPL", "WPL", "BBL", "WBBL",
+        "PSL", "SA20", "CPL", "WCPL", "MLC", "SUPER SMASH", "BLAST", "HUNDRED"
+    ]
+    exclusions = ["ODI", "ONE-DAY", "TEST", "FIRST-CLASS", "LIST A", "50 OVER"]
+
     try:
         res = requests.get(url, headers=HEADERS, timeout=8).json()
         raw_matches = res.get("content", {}).get("matches", [])
         for m in raw_matches:
+            format_name = m.get("format", "").upper()
+            series_name = m.get("series", {}).get("name", "").upper()
+            title = m.get("title", "").upper()
+            combined_text = f"{format_name} {series_name} {title}"
+
+            # Strict exclusion of non-T20 formats
+            if any(ex in combined_text for ex in exclusions):
+                continue
+
+            # Must match at least one popular T20 keyword
+            is_valid_t20 = any(kw in combined_text for kw in t20_keywords)
+            if not is_valid_t20:
+                continue
+
             status = m.get("status", "").lower()
             state = m.get("state", "").lower()
-            # Look for live in-progress matches
             if state in ["live", "in_progress"] or status in ["live", "in_progress"]:
                 teams = m.get("teams", [])
                 if len(teams) >= 2:
                     t1 = teams[0]
                     t2 = teams[1]
-                    matches.append({
+                    t20_matches.append({
                         "match_id": m.get("objectId"),
                         "title": f"{t1.get('team', {}).get('abbreviation', 'T1')} vs {t2.get('team', {}).get('abbreviation', 'T2')}",
-                        "series": m.get("series", {}).get("name", "Cricket"),
+                        "series": m.get("series", {}).get("name", "Global T20"),
                         "status_text": m.get("statusText", ""),
                         "team1_name": t1.get("team", {}).get("name", "Team 1"),
                         "team1_score": t1.get("score", ""),
                         "team2_name": t2.get("team", {}).get("name", "Team 2"),
                         "team2_score": t2.get("score", ""),
-                        "is_t1_batting": t1.get("isLive", False),
-                        "is_t2_batting": t2.get("isLive", False)
+                        "is_hundred": "HUNDRED" in combined_text
                     })
     except Exception as e:
-        print(f"Free score fetcher note: {e}")
-    return matches
+        print(f"Free score engine note: {e}")
+    return t20_matches
 
-# ==========================================
-# 2. INTERNAL ODDS & WIN PROBABILITY MODEL
-# ==========================================
-def calculate_internal_odds(runs: int, wickets: int, overs_bowled: float, target: int, total_overs: int = 20):
+# ===================================================
+# 2. INTERNAL PROBABILITY & RUN-RATE ENGINE
+# ===================================================
+def calculate_internal_t20_odds(runs: int, wickets: int, overs_bowled: float, target: int, is_hundred: bool = False):
     """
-    Calculates dynamic win probability and synthetic decimal odds for a 2nd innings chase.
+    Calculates dynamic win probability and synthetic odds for 120-ball (T20) or 100-ball formats.
     """
+    total_balls = 100 if is_hundred else 120
     wickets_in_hand = max(0, 10 - wickets)
-    balls_bowled = int(overs_bowled) * 6 + int(round((overs_bowled - int(overs_bowled)) * 10))
-    total_balls = total_overs * 6
+    
+    completed_overs = int(overs_bowled)
+    partial_balls = int(round((overs_bowled - completed_overs) * 10))
+    balls_bowled = completed_overs * 6 + partial_balls
     balls_remaining = max(1, total_balls - balls_bowled)
     runs_needed = max(0, target - runs)
 
     if runs_needed <= 0:
-        return 0.99, 1.01  # Already won
+        return 99.0, 1.01
 
     if wickets_in_hand == 0 or balls_remaining <= 0:
-        return 0.01, 50.0  # Already lost
+        return 1.0, 50.0
 
-    # Run Rates
-    crr = (runs / balls_bowled) * 6 if balls_bowled > 0 else 6.0
     rrr = (runs_needed / balls_remaining) * 6
-
-    # Par RRR model calibrated to T20 match averages
     par_rrr = 4.0 + (0.75 * wickets_in_hand)
     delta = par_rrr - rrr
 
-    # Match phase volatility scaler (higher leverage late in innings)
     phase_scale = 0.35 + 0.65 * (1.0 - (balls_remaining / total_balls))
     z = delta * phase_scale
 
-    # Logistic Win Probability Curve
     try:
         win_prob = 1.0 / (1.0 + math.exp(-z))
     except OverflowError:
         win_prob = 0.01 if z < 0 else 0.99
 
     win_prob = max(0.02, min(0.98, win_prob))
-    synthetic_back_odds = round(1.0 / win_prob, 2)
-    return round(win_prob * 100, 1), synthetic_back_odds
+    synthetic_odds = round(1.0 / win_prob, 2)
+    return round(win_prob * 100, 1), synthetic_odds
 
-# ==========================================
-# 3. BACKGROUND TWO-STAGE AUTO-POLLER
-# ==========================================
-def run_two_stage_monitoring():
-    """
-    Stage 1: Checks free score engine.
-    Stage 2: Pings Odds API only when internal model detects a valid entry or hedge exit.
-    """
+# ===================================================
+# 3. BACKGROUND MULTI-LEAGUE MONITOR
+# ===================================================
+def run_t20_two_stage_monitoring():
     open_trades = supabase.table("trades").select("*").eq("status", "OPEN").execute().data
+    if not open_trades:
+        return
 
-    # Check open trades for Green Book exit
     for trade in open_trades:
         chat_id = trade["chat_id"]
         trade_id = trade["id"]
         target_lay = float(trade["target_lay_odds"])
 
-        # Check real market rates (1 API credit) only when trade is live
-        url = f"https://api.theoddsapi.com/v4/sports/cricket_ipl/odds/?regions=uk,eu&markets=h2h&oddsFormat=decimal&apiKey={ODDS_API_KEY}"
-        try:
-            res = requests.get(url, timeout=8).json()
-            if isinstance(res, list):
-                for match in res:
-                    bookies = match.get("bookmakers", [])
-                    if not bookies:
-                        continue
-                    outcomes = bookies[0]["markets"][0].get("outcomes", [])
-                    for outcome in outcomes:
-                        if outcome["name"].upper() == trade["team_name"].upper():
-                            cur_price = float(outcome["price"])
-                            # EXIT TRIGGER: Target Lay Odds reached!
-                            if cur_price <= target_lay:
-                                back_stake = int(trade["back_stake"])
-                                lay_stake, net_profit = calculate_green_book(back_stake, float(trade["back_odds"]), cur_price)
-                                alert = (
-                                    f"🎯 *TARGET HIT: LOCK GREEN BOOK NOW!*\n\n"
-                                    f"• *Match:* {trade['match_title']}\n"
-                                    f"• *Team:* {trade['team_name']}\n"
-                                    f"• *Current Odds:* {cur_price} (Target: {target_lay})\n"
-                                    f"• *Execute Lay (Khai):* ₹{lay_stake}\n"
-                                    f"• *Locked Net Profit:* ₹{net_profit}\n\n"
-                                    f"Send `/hedge {trade_id} {cur_price}` to settle balance."
-                                )
-                                send_message(chat_id, alert)
-        except Exception as e:
-            print(f"Poller check error: {e}")
+        for sport_key in GLOBAL_T20_LEAGUES.keys():
+            url = f"https://api.theoddsapi.com/v4/sports/{sport_key}/odds/?regions=uk,eu&markets=h2h&oddsFormat=decimal&apiKey={ODDS_API_KEY}"
+            try:
+                res = requests.get(url, timeout=6).json()
+                if isinstance(res, list):
+                    for match in res:
+                        bookies = match.get("bookmakers", [])
+                        if not bookies:
+                            continue
+                        outcomes = bookies[0]["markets"][0].get("outcomes", [])
+                        for outcome in outcomes:
+                            if outcome["name"].upper() == trade["team_name"].upper():
+                                cur_price = float(outcome["price"])
+                                if cur_price <= target_lay:
+                                    back_stake = int(trade["back_stake"])
+                                    lay_stake, net_profit = calculate_green_book(back_stake, float(trade["back_odds"]), cur_price)
+                                    alert = (
+                                        f"🎯 *TARGET HIT: LOCK GREEN BOOK NOW!*\n\n"
+                                        f"• *Match:* {trade['match_title']}\n"
+                                        f"• *Team:* {trade['team_name']}\n"
+                                        f"• *Current Odds:* {cur_price} (Target: {target_lay})\n"
+                                        f"• *Execute Lay (Khai):* ₹{lay_stake}\n"
+                                        f"• *Locked Net Profit:* ₹{net_profit}\n\n"
+                                        f"Send `/hedge {trade_id} {cur_price}` to settle balance."
+                                    )
+                                    send_message(chat_id, alert)
+            except Exception:
+                continue
 
 @app.get("/")
 def health_check():
-    return {"status": "alive", "service": "TradexEngine"}
+    return {"status": "alive", "scope": "All_Popular_Global_T20s"}
 
 @app.get("/poll")
 def cron_poll():
-    run_two_stage_monitoring()
-    return {"status": "polled", "timestamp": "ok"}
+    run_t20_two_stage_monitoring()
+    return {"status": "polled", "scope": "all_t20s"}
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
@@ -200,7 +229,7 @@ async def telegram_webhook(request: Request):
         if cb_data.startswith("ACCEPT_"):
             trade_id = int(cb_data.split("_")[1])
             supabase.table("trades").update({"status": "OPEN"}).eq("id", trade_id).execute()
-            send_message(chat_id, f"✅ *Trade #{trade_id} activated.* Live Green Book monitoring is on.")
+            send_message(chat_id, f"✅ *T20 Trade #{trade_id} activated.* Live monitoring active.")
 
         elif cb_data.startswith("SKIP_"):
             trade_id = int(cb_data.split("_")[1])
@@ -233,11 +262,11 @@ async def telegram_webhook(request: Request):
 
             msg = (
                 f"🛡️ *CUT-LOSS EXECUTED (Trade #{trade_id})*\n\n"
-                f"• Position liquidated at odds: {cur_odds}\n"
+                f"• Liquidated at: {cur_odds}\n"
                 f"• Loss Incurred: ₹{loss_amount}\n"
-                f"• Capital Salvaged: ₹{salvaged} of ₹{back_stake}\n"
+                f"• Capital Saved: ₹{salvaged} of ₹{back_stake}\n"
                 f"• *Current Bankroll:* ₹{new_bankroll}\n\n"
-                f"Trade slot cleared. Capital preserved."
+                f"Slot cleared. Capital protected for next setup."
             )
             send_message(chat_id, msg)
 
@@ -262,34 +291,60 @@ async def telegram_webhook(request: Request):
             }).execute()
 
         welcome = (
-            "🏏 *Tradex Quantitative Cricket Engine*\n\n"
+            "🏏 *Tradex All-T20 Engine*\n\n"
+            "• *Coverage:* Men's & Women's T20Is, IPL, WPL, BBL, WBBL, PSL, MLC, CPL, SA20, Super Smash, The Hundred, Blast\n"
             "• *Virtual Bankroll:* ₹10,000\n"
-            "• *Standard Swing Risk:* 5% (₹500)\n"
-            "• *Jackpot Risk:* 1% (₹100)\n"
-            "• *Free Score Engine:* Active (0 API credits used)\n\n"
+            "• *Standard Swing (Overs 3-15):* 5% (₹500)\n"
+            "• *Death Overs Jackpot (Overs 16-20):* 1% (₹100)\n"
+            "• *Max Active Trades:* 2 (Strict anti-spam)\n\n"
             "*Core Commands:*\n"
-            "`/live` — Check free score feed & synthetic odds\n"
-            "`/calc <Runs> <Wkts> <Overs> <Target>` — Test odds calculator\n"
-            "`/trade <Team> <Odds> <Match>` — Log standard swing trade\n"
-            "`/jackpot <Team> <Odds> <Match>` — Log micro-stake jackpot (1%)\n"
-            "`/hedge <TradeID> <Odds>` — Lock Green Book profit\n"
-            "`/cutloss <TradeID> <Odds>` — Defensive capital preservation\n"
-            "`/active` — Check open trade slots\n"
-            "`/balance` — View bankroll & ledger summary"
+            "`/upcoming` — View scheduled T20 fixtures across all leagues\n"
+            "`/live` — Check in-progress T20 scores & synthetic rates\n"
+            "`/calc <Runs> <Wkts> <Overs> <Target>` — T20 odds calculator\n"
+            "`/trade <Team> <Odds> <Match>` — Log swing trade\n"
+            "`/jackpot <Team> <Odds> <Match>` — Log 1% micro-stake trade\n"
+            "`/hedge <TradeID> <Odds>` — Lock Green Book\n"
+            "`/cutloss <TradeID> <Odds>` — Capital protection exit\n"
+            "`/active` — Check open slots\n"
+            "`/balance` — View bankroll audit"
         )
         send_message(chat_id, welcome)
         return {"ok": True}
 
-    # /live (Free Score Engine Status)
+    # /upcoming (Checks all 13 popular T20 tournaments)
+    if text == "/upcoming":
+        send_message(chat_id, "📅 *Scanning upcoming fixtures across all popular Men's & Women's T20s...*")
+        upcoming_list = []
+        for sport_key, league_name in GLOBAL_T20_LEAGUES.items():
+            url = f"https://api.theoddsapi.com/v4/sports/{sport_key}/events?apiKey={ODDS_API_KEY}"
+            try:
+                res = requests.get(url, timeout=5).json()
+                if isinstance(res, list) and len(res) > 0:
+                    for ev in res[:2]:
+                        home = ev.get("home_team")
+                        away = ev.get("away_team")
+                        commence = ev.get("commence_time", "").replace("T", " ")[:16]
+                        upcoming_list.append(f"• *{home} vs {away}*\n  🏆 {league_name}\n  🕒 {commence} UTC")
+            except Exception:
+                continue
+
+        if not upcoming_list:
+            send_message(chat_id, "No popular T20 fixtures starting in the next 24 hours.")
+        else:
+            report = "🏏 *Upcoming Popular T20 Matches:*\n\n" + "\n\n".join(upcoming_list[:8])
+            send_message(chat_id, report)
+        return {"ok": True}
+
+    # /live (Strictly T20s & 100-Ball)
     if text == "/live":
-        send_message(chat_id, "📡 *Polling free live match engine...*")
-        live_matches = fetch_free_live_scores()
-        if not live_matches:
-            send_message(chat_id, "No live fixtures currently in progress on the free feed.\nUse `/calc` to test the internal odds math on any scenario!")
+        send_message(chat_id, "📡 *Scanning live T20 scores across all popular leagues...*")
+        t20_matches = fetch_free_t20_scores()
+        if not t20_matches:
+            send_message(chat_id, "No live T20 matches in progress right now.\n(ODIs/Tests are excluded). Use `/calc` to test scenarios!")
             return {"ok": True}
 
-        report = "🏏 *Live Fixtures (Free Score Feed):*\n\n"
-        for m in live_matches[:3]:
+        report = "🏏 *Live Global T20 Fixtures:*\n\n"
+        for m in t20_matches[:4]:
             report += (
                 f"• *{m['title']}* ({m['series']})\n"
                 f"  {m['team1_name']}: {m['team1_score']}\n"
@@ -299,13 +354,11 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, report)
         return {"ok": True}
 
-    # /calc (Manual Situation Odds Calculator)
-    # Usage: /calc <Runs> <Wickets> <Overs> <Target>
-    # Example: /calc 95 3 12.0 180
+    # /calc
     if text.startswith("/calc"):
         parts = text.split()
         if len(parts) != 5:
-            send_message(chat_id, "⚠️ *Format:* `/calc <Runs> <Wickets> <Overs> <Target>`\n*Example:* `/calc 95 3 12.0 180`")
+            send_message(chat_id, "⚠️ *Format:* `/calc <Runs> <Wickets> <Overs> <Target>`\n*Example:* `/calc 110 3 13.2 165`")
             return {"ok": True}
 
         try:
@@ -317,24 +370,27 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, "Please enter valid numbers.")
             return {"ok": True}
 
-        prob, odds = calculate_internal_odds(r, w, ov, target)
-        rrr = round(((target - r) / max(1, (120 - int(ov * 6)))) * 6, 2)
+        prob, odds = calculate_internal_t20_odds(r, w, ov, target)
+        completed_ov = int(ov)
+        balls_done = completed_ov * 6 + int(round((ov - completed_ov) * 10))
+        balls_left = max(1, 120 - balls_done)
+        rrr = round(((target - r) / balls_left) * 6, 2)
 
         card = (
-            f"🧠 *INTERNAL QUANTITATIVE ODDS ENGINE*\n\n"
-            f"• *Current State:* {r}/{w} in {ov} overs\n"
+            f"🧠 *T20 QUANTITATIVE MODEL*\n\n"
+            f"• *State:* {r}/{w} in {ov} overs ({balls_left} balls left)\n"
             f"• *Target:* {target} (Needs {target - r} runs)\n"
             f"• *Required Run Rate:* {rrr} RPO\n"
             f"─────────────────────────\n"
             f"📊 *Chasing Win Probability:* {prob}%\n"
             f"📈 *Synthetic Decimal Odds:* {odds}\n\n"
         )
-        if 2.10 <= odds <= 2.50:
-            card += "⚡ *Signal:* Optimal Swing Back Zone! (High value mean-reversion)"
-        elif odds >= 5.00:
-            card += "🎰 *Signal:* High R:R Jackpot Territory! (Micro-stake 1% candidate)"
+        if ov >= 16.0 and odds >= 4.50:
+            card += "🎰 *Signal:* Death Overs Jackpot Candidate (1% Micro-Stake)!"
+        elif 2.10 <= odds <= 2.50 and ov < 16.0:
+            card += "⚡ *Signal:* Standard Swing Zone (5% Stake)!"
         else:
-            card += "⚪ *Signal:* Normal market range. Standing by."
+            card += "⚪ *Signal:* Normal variance. Standing by."
 
         send_message(chat_id, card)
         return {"ok": True}
@@ -343,7 +399,7 @@ async def telegram_webhook(request: Request):
     if text == "/balance":
         user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
         bankroll = int(user["bankroll"])
-        send_message(chat_id, f"💰 *Current Virtual Bankroll:* ₹{bankroll}\n• Swing Stake (5%): ₹{int(bankroll * 0.05)}\n• Jackpot Stake (1%): ₹{int(bankroll * 0.01)}")
+        send_message(chat_id, f"💰 *Current Virtual Bankroll:* ₹{bankroll}\n• Standard Swing Stake (5%): ₹{int(bankroll * 0.05)}\n• Death Overs Jackpot Stake (1%): ₹{int(bankroll * 0.01)}")
         return {"ok": True}
 
     # /active
@@ -353,13 +409,13 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, "No active trades running. (0/2 slots used)")
             return {"ok": True}
 
-        report = f"*Active Positions ({len(open_trades)}/2 slots used):*\n\n"
+        report = f"*Active T20 Trades ({len(open_trades)}/2 slots used):*\n\n"
         for t in open_trades:
             report += (
                 f"• *ID #{t['id']} [{t['trade_type']}]:* {t['team_name']} ({t['match_title']})\n"
                 f"  Entry: Back @ {t['back_odds']} | Stake: ₹{int(t['back_stake'])}\n"
                 f"  🎯 Target Lay: {t['target_lay_odds']} (`/hedge {t['id']} <odds>`)\n"
-                f"  🛡️ Stop-Loss Trigger: {t['stop_loss_odds']} (`/cutloss {t['id']} <odds>`)\n\n"
+                f"  🛡️ Cut-Loss Trigger: {t['stop_loss_odds']} (`/cutloss {t['id']} <odds>`)\n\n"
             )
         send_message(chat_id, report)
         return {"ok": True}
@@ -400,18 +456,18 @@ async def telegram_webhook(request: Request):
             "stop_loss_odds": stop_loss,
             "trade_type": "SWING",
             "status": "OPEN" if user["auto_pilot"] else "PENDING",
-            "entry_reason": f"Standard swing entry on {team} @ {back_odds}. Target lay: {target_lay}."
+            "entry_reason": f"T20 swing entry on {team} @ {back_odds}. Target lay: {target_lay}."
         }).execute().data[0]
 
         card = (
-            f"🚨 *NEW SWING TRADE (ID #{inserted['id']})*\n\n"
+            f"🚨 *NEW T20 SWING TRADE (ID #{inserted['id']})*\n\n"
             f"• *Match:* {match_title}\n"
             f"• *Action:* BACK (Lagai) *{team}*\n"
             f"• *Entry Odds:* {back_odds}\n"
             f"• *Allocated Stake:* ₹{stake} (5% Bankroll)\n"
             f"• *Green Book Lay Target:* {target_lay}\n"
             f"• *Cut-Loss Boundary:* {stop_loss}\n\n"
-            f"📊 *Reason:* 2nd innings / middle overs dip. Target 30% contraction for equalized profit."
+            f"📊 *Reason:* Overs 3-15 overreaction dip. Target 30% contraction for equalized profit."
         )
 
         if user["auto_pilot"]:
@@ -426,7 +482,7 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, card, reply_markup=keyboard)
         return {"ok": True}
 
-    # /jackpot (Micro-Stake Entry)
+    # /jackpot (Death Overs 1% Entry)
     if text.startswith("/jackpot"):
         parts = text.split(" ", 3)
         if len(parts) < 4:
@@ -465,17 +521,17 @@ async def telegram_webhook(request: Request):
             "stop_loss_odds": stop_loss,
             "trade_type": "JACKPOT",
             "status": "OPEN" if user["auto_pilot"] else "PENDING",
-            "entry_reason": f"Death overs jackpot on {team} @ {back_odds}. Micro-stake asymmetric reward."
+            "entry_reason": f"Death overs jackpot on {team} @ {back_odds}. 1% micro-stake."
         }).execute().data[0]
 
         card = (
-            f"🎰 *JACKPOT MICRO-TRADE (ID #{inserted['id']})*\n\n"
+            f"🎰 *T20 DEATH OVERS JACKPOT (ID #{inserted['id']})*\n\n"
             f"• *Match:* {match_title}\n"
             f"• *Action:* BACK (Lagai) *{team}*\n"
             f"• *Cheap Entry Odds:* {back_odds}\n"
-            f"• *Micro Stake:* ₹{stake} (1% Bankroll)\n"
+            f"• *Micro Stake:* ₹{stake} (Only 1% Bankroll)\n"
             f"• *Target Lay (Green Book):* {target_lay}\n\n"
-            f"🧠 *Reason:* High R:R asymmetric setup. Minimal risk (₹{stake}) with large upside."
+            f"🧠 *Reason:* High R:R late-phase volatility. Capped ₹{stake} risk with outsized payout."
         )
 
         if user["auto_pilot"]:
@@ -539,7 +595,7 @@ async def telegram_webhook(request: Request):
             f"─────────────────────────\n"
             f"🎉 *Net Locked Profit (after 2% commission):* ₹{net_profit}\n"
             f"💰 *Updated Bankroll:* ₹{new_bankroll}\n\n"
-            f"Both outcomes risk-free. Trade slot cleared!"
+            f"Both sides risk-free. Trade slot cleared!"
         )
         send_message(chat_id, settlement_msg)
         return {"ok": True}
@@ -577,7 +633,7 @@ async def telegram_webhook(request: Request):
             f"• Original Stake: ₹{back_stake} @ {t['back_odds']}\n"
             f"• Current Market Rate: {cur_odds}\n"
             f"• Estimated Loss: ₹{loss}\n"
-            f"• Capital Salvaged: ₹{salvaged}\n\n"
+            f"• Capital You Save: ₹{salvaged}\n\n"
             f"Do you want to liquidate now to avoid a full ₹{back_stake} loss?"
         )
         send_message(chat_id, prompt, reply_markup=keyboard)
