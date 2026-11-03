@@ -58,118 +58,157 @@ def mark_alert_sent(alert_key: str):
         pass
 
 # ===================================================
-# 1. AUTOMATED CREX SCRAPER & NEXT_DATA EXTRACTOR
+# 1. LIVE CREX SCRAPER (RATES & IN-PLAY ODDS)
 # ===================================================
 def fetch_crex_live_data():
     """
-    Auto-discovers live T20 matches and extracts their real-time 
-    decimal odds directly from CREX Next.js payload.
+    Pulls live match cards and current odds directly from CREX Next.js state.
     """
     url = "https://crex.com/live-score"
     matches = []
-    
     t20_whitelist = ["T20", "WBBL", "BBL", "IPL", "WPL", "PSL", "SA20", "CPL", "BLAST", "HUNDRED"]
     exclusions = ["ODI", "TEST", "FIRST-CLASS", "LIST A"]
 
     try:
         resp = requests.get(url, headers=HEADERS, timeout=8)
-        if resp.status_code != 200:
-            return matches
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        next_script = soup.find("script", id="__NEXT_DATA__")
-        
-        if next_script and next_script.string:
-            data = json.loads(next_script.string)
-            page_props = data.get("props", {}).get("pageProps", {})
-            live_list = page_props.get("liveMatches", []) or page_props.get("matches", [])
-            
-            for m in live_list:
-                s_name = str(m.get("seriesName", "")).upper()
-                m_format = str(m.get("format", "")).upper()
-                m_title = str(m.get("matchName", "") or m.get("title", "")).upper()
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            next_script = soup.find("script", id="__NEXT_DATA__")
+            if next_script and next_script.string:
+                data = json.loads(next_script.string)
+                page_props = data.get("props", {}).get("pageProps", {})
+                live_list = page_props.get("liveMatches", []) or page_props.get("matches", [])
                 
-                # Format check
-                if any(ex in f"{s_name} {m_format}" for ex in exclusions):
-                    continue
-                if not any(kw in f"{s_name} {m_format} {m_title}" for kw in t20_whitelist):
-                    continue
+                for m in live_list:
+                    s_name = str(m.get("seriesName", "")).upper()
+                    m_format = str(m.get("format", "")).upper()
+                    m_title = str(m.get("matchName", "") or m.get("title", "")).upper()
+                    
+                    if any(ex in f"{s_name} {m_format}" for ex in exclusions):
+                        continue
+                    if not any(kw in f"{s_name} {m_format} {m_title}" for kw in t20_whitelist):
+                        continue
 
-                # Extract live odds
-                odds_data = m.get("odds", {}) or m.get("matchOdds", {})
-                t1_odds = float(odds_data.get("team1Odds") or odds_data.get("t1Odds") or 0.0)
-                t2_odds = float(odds_data.get("team2Odds") or odds_data.get("t2Odds") or 0.0)
-                
-                matches.append({
-                    "id": str(m.get("matchId") or m.get("id")),
-                    "series": m.get("seriesName", "T20 Match"),
-                    "title": f"{m.get('team1', {}).get('name', 'T1')} vs {m.get('team2', {}).get('name', 'T2')}",
-                    "team1": m.get("team1", {}).get("name", "Team 1"),
-                    "team2": m.get("team2", {}).get("name", "Team 2"),
-                    "team1_odds": t1_odds,
-                    "team2_odds": t2_odds,
-                    "status": m.get("statusText", "Live")
-                })
+                    odds_data = m.get("odds", {}) or m.get("matchOdds", {})
+                    t1_odds = float(odds_data.get("team1Odds") or odds_data.get("t1Odds") or 0.0)
+                    t2_odds = float(odds_data.get("team2Odds") or odds_data.get("t2Odds") or 0.0)
+                    
+                    matches.append({
+                        "id": str(m.get("matchId") or m.get("id")),
+                        "series": m.get("seriesName", "T20 Match"),
+                        "title": f"{m.get('team1', {}).get('name', 'T1')} vs {m.get('team2', {}).get('name', 'T2')}",
+                        "team1": m.get("team1", {}).get("name", "Team 1"),
+                        "team2": m.get("team2", {}).get("name", "Team 2"),
+                        "team1_odds": t1_odds,
+                        "team2_odds": t2_odds,
+                        "status": m.get("statusText", "Live")
+                    })
     except Exception as e:
-        print(f"CREX engine note: {e}")
+        print(f"CREX live error: {e}")
 
     return matches
 
 # ===================================================
-# 2. MULTI-DAY T20 SCHEDULE ENGINE (WBBL / GLOBAL)
+# 2. CREX SCHEDULE SCRAPER (UPCOMING WBBL & T20s)
 # ===================================================
 def fetch_upcoming_t20_schedule():
     """
-    Pulls multi-day schedules from ESPN Cricinfo JSON feed without API cost.
+    Scrapes upcoming T20 fixtures directly from https://crex.com/schedule.
+    Uses Next.js state extraction with an HTML regex fallback.
     """
-    endpoints = [
-        "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/current?lang=en&latest=true",
-        "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/schedule?lang=en"
-    ]
-    t20_keywords = ["T20", "TWENTY20", "T20I", "WT20", "IPL", "WPL", "BBL", "WBBL", "BIG BASH", "WOMEN'S BIG BASH", "PSL", "SA20", "CPL", "WCPL", "MLC", "BLAST", "HUNDRED"]
-    exclusions = ["ODI", "ONE-DAY", "TEST", "FIRST-CLASS", "LIST A", "50 OVER"]
-
+    url = "https://crex.com/schedule"
     upcoming = []
     seen = set()
 
-    for u in endpoints:
+    t20_whitelist = ["T20", "WBBL", "BBL", "IPL", "WPL", "PSL", "SA20", "CPL", "BLAST", "HUNDRED"]
+    exclusions = ["ODI", "TEST", "FIRST-CLASS", "LIST A", "YOUTH"]
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=8)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            
+            # Method 1: Traverse __NEXT_DATA__
+            next_script = soup.find("script", id="__NEXT_DATA__")
+            if next_script and next_script.string:
+                try:
+                    data = json.loads(next_script.string)
+                    def extract_from_dict(d):
+                        items = []
+                        if isinstance(d, dict):
+                            t1 = d.get("team1Name") or (d.get("team1", {}).get("name") if isinstance(d.get("team1"), dict) else None)
+                            t2 = d.get("team2Name") or (d.get("team2", {}).get("name") if isinstance(d.get("team2"), dict) else None)
+                            series = d.get("seriesName") or d.get("series") or d.get("tournamentName")
+                            m_format = d.get("format") or d.get("matchType") or ""
+                            status = d.get("statusText") or d.get("startTime") or d.get("startDate") or "Scheduled"
+
+                            if t1 and t2:
+                                combined = f"{t1} {t2} {series} {m_format}".upper()
+                                if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
+                                    items.append({
+                                        "title": f"{t1} vs {t2}",
+                                        "series": str(series or "T20 League"),
+                                        "status_text": str(status)
+                                    })
+                            for val in d.values():
+                                items.extend(extract_from_dict(val))
+                        elif isinstance(d, list):
+                            for x in d:
+                                items.extend(extract_from_dict(x))
+                        return items
+
+                    for item in extract_from_dict(data.get("props", {}).get("pageProps", {})):
+                        if item["title"] not in seen:
+                            seen.add(item["title"])
+                            upcoming.append(item)
+                except Exception as je:
+                    print(f"JSON traversal error: {je}")
+
+            # Method 2: DOM Text Pattern Fallback
+            if not upcoming:
+                text_content = soup.get_text(separator="\n")
+                lines = [line.strip() for line in text_content.splitlines() if line.strip()]
+                for i in range(len(lines) - 3):
+                    curr = lines[i].upper()
+                    if ("T20" in curr or "WBBL" in curr) and not any(ex in curr for ex in exclusions):
+                        series_tag = lines[i]
+                        team1_cand = lines[i+1]
+                        team2_cand = lines[i+2]
+                        time_cand = lines[i+3]
+                        
+                        if len(team1_cand) < 35 and len(team2_cand) < 35 and any(t_kw in time_cand for t_kw in ["Starts", "AM", "PM", "Tomorrow", "Nov"]):
+                            match_title = f"{team1_cand} vs {team2_cand}"
+                            if match_title not in seen:
+                                seen.add(match_title)
+                                upcoming.append({
+                                    "title": match_title,
+                                    "series": series_tag,
+                                    "status_text": time_cand
+                                })
+    except Exception as e:
+        print(f"CREX schedule fetch error: {e}")
+
+    # Method 3: Open ESPN Web API Fallback (Never blocked by cloud datacenters)
+    if not upcoming:
         try:
-            res = requests.get(u, headers=HEADERS, timeout=8).json()
-            content = res.get("content", {})
-            raw = content.get("matches", []) or res.get("matches", [])
-
-            if not raw and "days" in content:
-                for d in content.get("days", []):
-                    raw.extend(d.get("matches", []))
-
-            for m in raw:
-                if not isinstance(m, dict):
-                    continue
-                mid = str(m.get("objectId", ""))
-                if mid in seen:
-                    continue
-
-                combined = f"{m.get('format', '')} {m.get('series', {}).get('name', '')} {m.get('title', '')}".upper()
-                if any(ex in combined for ex in exclusions) or not any(kw in combined for kw in t20_keywords):
-                    continue
-
-                teams = m.get("teams", [])
-                if len(teams) < 2:
-                    continue
-
-                t1_name = teams[0].get("team", {}).get("name", "Team 1")
-                t2_name = teams[1].get("team", {}).get("name", "Team 2")
-                status_text = m.get("statusText") or "Scheduled"
-
-                upcoming.append({
-                    "id": mid,
-                    "title": f"{t1_name} vs {t2_name}",
-                    "series": m.get("series", {}).get("name", "T20 League"),
-                    "status_text": status_text
-                })
-                seen.add(mid)
-        except Exception:
-            continue
+            espn_url = "https://site.web.api.espn.com/apis/site/v2/sports/cricket/scorepanel"
+            r = requests.get(espn_url, headers=HEADERS, timeout=6).json()
+            for league in r.get("leagues", []):
+                for event in league.get("events", []):
+                    c_title = event.get("name", "")
+                    c_series = league.get("name", "T20")
+                    combined = f"{c_title} {c_series}".upper()
+                    if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
+                        if c_title not in seen:
+                            seen.add(c_title)
+                            status_desc = event.get("status", {}).get("type", {}).get("detail", "Scheduled")
+                            upcoming.append({
+                                "title": c_title,
+                                "series": c_series,
+                                "status_text": status_desc
+                            })
+        except Exception as ee:
+            print(f"ESPN web fallback error: {ee}")
 
     return upcoming
 
@@ -181,7 +220,6 @@ def automated_background_engine():
     if not users:
         return
 
-    # Check CREX live odds
     crex_matches = fetch_crex_live_data()
 
     for u in users:
@@ -189,7 +227,6 @@ def automated_background_engine():
         bankroll = int(u["bankroll"])
         autopilot = u.get("auto_pilot", False)
 
-        # 1. Check open trades against live odds
         open_trades = supabase.table("trades").select("*").eq("chat_id", chat_id).eq("status", "OPEN").execute().data
         for trade in open_trades:
             t_id = trade["id"]
@@ -207,7 +244,6 @@ def automated_background_engine():
                 if not cur_price or cur_price <= 1.0:
                     continue
 
-                # GREEN BOOK TARGET REACHED
                 if cur_price <= target_lay:
                     alert_key = f"HEDGE_TRIGGER_{t_id}_{cur_price}"
                     if not is_alert_sent(alert_key):
@@ -225,7 +261,6 @@ def automated_background_engine():
                         send_message(chat_id, msg)
                         mark_alert_sent(alert_key)
 
-                # DEFENSIVE CUT-LOSS LIMIT
                 elif cur_price >= stop_loss and stop_loss > 0:
                     alert_key = f"CUTLOSS_TRIGGER_{t_id}"
                     if not is_alert_sent(alert_key):
@@ -246,7 +281,6 @@ def automated_background_engine():
                         send_message(chat_id, msg, reply_markup=keyboard)
                         mark_alert_sent(alert_key)
 
-        # 2. Automated value swing entries (Overs 3-15: 2.10 to 2.50)
         if len(open_trades) < 2:
             for cm in crex_matches:
                 for team_key, odds in [(cm["team1"], cm["team1_odds"]), (cm["team2"], cm["team2_odds"])]:
@@ -297,7 +331,7 @@ def automated_background_engine():
 
 @app.get("/")
 def health_check():
-    return {"status": "alive", "engine": "CREX_Automated_Engine"}
+    return {"status": "alive", "engine": "CREX_Live_Engine"}
 
 @app.get("/poll")
 def cron_poll():
@@ -380,13 +414,13 @@ async def telegram_webhook(request: Request):
 
         welcome = (
             "🏏 *Tradex CREX Automated Trading Engine*\n\n"
-            "• *Data Source:* Live CREX Next.js Odds & Multi-day schedule\n"
+            "• *Source:* Live CREX Web Feed & Schedule\n"
             "• *Virtual Bankroll:* ₹10,000\n"
             "• *Standard Swing (Overs 3-15):* 5% (₹500)\n"
             "• *Death Overs Jackpot (Overs 16-20):* 1% (₹100)\n"
-            "• *Max Active Trades:* 2 (Strict concurrency guard)\n\n"
+            "• *Max Active Trades:* 2\n\n"
             "*Commands:*\n"
-            "`/upcoming` — Multi-day T20 & WBBL schedule\n"
+            "`/upcoming` — Multi-day T20 & WBBL schedule (CREX)\n"
             "`/live` — Live CREX match odds\n"
             "`/autopilot` — Toggle auto-trade logging\n"
             "`/trade <Team> <Odds> <Match>` — Manual swing entry\n"
@@ -400,12 +434,12 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     if text == "/upcoming":
-        send_message(chat_id, "📅 *Scanning multi-day schedule for WBBL & global T20s...*")
+        send_message(chat_id, "📅 *Fetching schedule from CREX...*")
         upcoming = fetch_upcoming_t20_schedule()
         if not upcoming:
             send_message(chat_id, "No scheduled T20 fixtures found.")
         else:
-            report = "🏏 *Upcoming T20 Matches:*\n\n"
+            report = "🏏 *Upcoming Popular T20 Matches (CREX):*\n\n"
             for m in upcoming[:8]:
                 report += f"• *{m['title']}*\n  🏆 {m['series']}\n  🕒 {m['status_text']}\n\n"
             send_message(chat_id, report)
@@ -415,7 +449,7 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, "📡 *Scanning live CREX match odds...*")
         crex_data = fetch_crex_live_data()
         if not crex_data:
-            send_message(chat_id, "No live T20 match in progress on CREX right now.\n(WBBL Match starts tomorrow at 1:40 pm IST).\n\nUse `/upcoming` to view the multi-day schedule.")
+            send_message(chat_id, "No live T20 match in progress on CREX right now.\n(Hobart Hurricanes vs Melbourne Renegades starts tomorrow at 8:10 AM / 1:40 PM IST).\n\nUse `/upcoming` to view the full fixture list.")
             return {"ok": True}
 
         report = "🏏 *Live CREX Matches & Odds:*\n\n"
@@ -559,7 +593,7 @@ async def telegram_webhook(request: Request):
             f"• *Original Back:* ₹{back_stake} @ {back_odds}\n"
             f"• *Execute Lay (Khai):* ₹{lay_stake} @ {cur_lay_odds}\n"
             f"─────────────────────────\n"
-            f"🎉 *Net Locked Profit (after 2% commission):* ₹{net_profit}\n"
+            f"🎉 *Net Locked Profit:* ₹{net_profit}\n"
             f"💰 *Updated Bankroll:* ₹{new_bankroll}\n\n"
             f"Both sides risk-free. Trade slot cleared!"
         )
