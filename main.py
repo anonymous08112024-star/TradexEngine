@@ -16,7 +16,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-EXCHANGE_COMMISSION = 0.02
+EXCHANGE_COMMISSION = 0.02  # 2% exchange commission
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -32,7 +32,7 @@ def send_message(chat_id: int, text: str, reply_markup: dict = None):
         res = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=8)
         return res.json().get("result", {})
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram dispatch error: {e}")
         return {}
 
 def calculate_green_book(back_stake: int, back_odds: float, current_lay_odds: float):
@@ -57,13 +57,38 @@ def mark_alert_sent(alert_key: str):
     except Exception:
         pass
 
+def calculate_internal_t20_odds(runs: int, wickets: int, overs_bowled: float, target: int):
+    total_balls = 120
+    wickets_in_hand = max(0, 10 - wickets)
+    completed_ov = int(overs_bowled)
+    balls_bowled = completed_ov * 6 + int(round((overs_bowled - completed_ov) * 10))
+    balls_remaining = max(1, total_balls - balls_bowled)
+    runs_needed = max(0, target - runs)
+
+    if runs_needed <= 0:
+        return 99.0, 1.01
+    if wickets_in_hand == 0 or balls_remaining <= 0:
+        return 1.0, 50.0
+
+    rrr = (runs_needed / balls_remaining) * 6
+    par_rrr = 4.0 + (0.75 * wickets_in_hand)
+    delta = par_rrr - rrr
+
+    phase_scale = 0.35 + 0.65 * (1.0 - (balls_remaining / total_balls))
+    z = delta * phase_scale
+
+    try:
+        win_prob = 1.0 / (1.0 + math.exp(-z))
+    except OverflowError:
+        win_prob = 0.01 if z < 0 else 0.99
+
+    win_prob = max(0.02, min(0.98, win_prob))
+    return round(win_prob * 100, 1), round(1.0 / win_prob, 2)
+
 # ===================================================
-# 1. LIVE CREX SCRAPER (RATES & IN-PLAY ODDS)
+# 1. LIVE CREX SCRAPER (IN-PLAY DECIMAL ODDS)
 # ===================================================
 def fetch_crex_live_data():
-    """
-    Pulls live match cards and current odds directly from CREX Next.js state.
-    """
     url = "https://crex.com/live-score"
     matches = []
     t20_whitelist = ["T20", "WBBL", "BBL", "IPL", "WPL", "PSL", "SA20", "CPL", "BLAST", "HUNDRED"]
@@ -104,18 +129,14 @@ def fetch_crex_live_data():
                         "status": m.get("statusText", "Live")
                     })
     except Exception as e:
-        print(f"CREX live error: {e}")
+        print(f"CREX live fetch error: {e}")
 
     return matches
 
 # ===================================================
-# 2. CREX SCHEDULE SCRAPER (UPCOMING WBBL & T20s)
+# 2. BOUNDED CREX SCHEDULE SCRAPER (UPCOMING FIXTURES)
 # ===================================================
 def fetch_upcoming_t20_schedule():
-    """
-    Scrapes upcoming T20 fixtures directly from https://crex.com/schedule.
-    Uses Next.js state extraction with an HTML regex fallback.
-    """
     url = "https://crex.com/schedule"
     upcoming = []
     seen = set()
@@ -127,93 +148,72 @@ def fetch_upcoming_t20_schedule():
         resp = requests.get(url, headers=HEADERS, timeout=8)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
-            
-            # Method 1: Traverse __NEXT_DATA__
             next_script = soup.find("script", id="__NEXT_DATA__")
+            
             if next_script and next_script.string:
-                try:
-                    data = json.loads(next_script.string)
-                    def extract_from_dict(d):
-                        items = []
-                        if isinstance(d, dict):
-                            t1 = d.get("team1Name") or (d.get("team1", {}).get("name") if isinstance(d.get("team1"), dict) else None)
-                            t2 = d.get("team2Name") or (d.get("team2", {}).get("name") if isinstance(d.get("team2"), dict) else None)
-                            series = d.get("seriesName") or d.get("series") or d.get("tournamentName")
-                            m_format = d.get("format") or d.get("matchType") or ""
-                            status = d.get("statusText") or d.get("startTime") or d.get("startDate") or "Scheduled"
+                data = json.loads(next_script.string)
+                page_props = data.get("props", {}).get("pageProps", {})
 
-                            if t1 and t2:
-                                combined = f"{t1} {t2} {series} {m_format}".upper()
-                                if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
-                                    items.append({
-                                        "title": f"{t1} vs {t2}",
-                                        "series": str(series or "T20 League"),
-                                        "status_text": str(status)
-                                    })
-                            for val in d.values():
-                                items.extend(extract_from_dict(val))
-                        elif isinstance(d, list):
-                            for x in d:
-                                items.extend(extract_from_dict(x))
-                        return items
+                def find_match_cards(node):
+                    cards = []
+                    if isinstance(node, dict):
+                        has_t1 = "team1" in node or "team1Name" in node
+                        has_t2 = "team2" in node or "team2Name" in node
+                        if has_t1 and has_t2:
+                            cards.append(node)
+                        else:
+                            for v in node.values():
+                                cards.extend(find_match_cards(v))
+                    elif isinstance(node, list):
+                        for item in node:
+                            cards.extend(find_match_cards(item))
+                    return cards
 
-                    for item in extract_from_dict(data.get("props", {}).get("pageProps", {})):
-                        if item["title"] not in seen:
-                            seen.add(item["title"])
-                            upcoming.append(item)
-                except Exception as je:
-                    print(f"JSON traversal error: {je}")
+                raw_cards = find_match_cards(page_props)
 
-            # Method 2: DOM Text Pattern Fallback
-            if not upcoming:
-                text_content = soup.get_text(separator="\n")
-                lines = [line.strip() for line in text_content.splitlines() if line.strip()]
-                for i in range(len(lines) - 3):
-                    curr = lines[i].upper()
-                    if ("T20" in curr or "WBBL" in curr) and not any(ex in curr for ex in exclusions):
-                        series_tag = lines[i]
-                        team1_cand = lines[i+1]
-                        team2_cand = lines[i+2]
-                        time_cand = lines[i+3]
-                        
-                        if len(team1_cand) < 35 and len(team2_cand) < 35 and any(t_kw in time_cand for t_kw in ["Starts", "AM", "PM", "Tomorrow", "Nov"]):
-                            match_title = f"{team1_cand} vs {team2_cand}"
-                            if match_title not in seen:
-                                seen.add(match_title)
-                                upcoming.append({
-                                    "title": match_title,
-                                    "series": series_tag,
-                                    "status_text": time_cand
-                                })
+                for card in raw_cards:
+                    t1_obj = card.get("team1")
+                    t2_obj = card.get("team2")
+                    
+                    t1 = card.get("team1Name") or (t1_obj.get("name") if isinstance(t1_obj, dict) else t1_obj)
+                    t2 = card.get("team2Name") or (t2_obj.get("name") if isinstance(t2_obj, dict) else t2_obj)
+                    
+                    if not t1 or not t2 or str(t1).strip() == str(t2).strip():
+                        continue
+
+                    t1 = str(t1).strip()
+                    t2 = str(t2).strip()
+
+                    series = str(card.get("seriesName") or card.get("series") or "T20 Match").strip()
+                    m_format = str(card.get("format") or card.get("matchType") or "").strip()
+                    status = str(card.get("statusText") or card.get("startTime") or card.get("startDate") or "Scheduled").strip()
+
+                    combined = f"{t1} {t2} {series} {m_format}".upper()
+                    
+                    if any(ex in combined for ex in exclusions):
+                        continue
+                    if not any(kw in combined for kw in t20_whitelist):
+                        continue
+
+                    t1 = re.sub(r"^[,\s]+", "", t1)
+                    t2 = re.sub(r"^[,\s]+", "", t2)
+                    series = re.sub(r"^[,\s]+", "", series)
+
+                    match_title = f"{t1} vs {t2}"
+                    if match_title not in seen:
+                        seen.add(match_title)
+                        upcoming.append({
+                            "title": match_title,
+                            "series": series,
+                            "status_text": status
+                        })
     except Exception as e:
         print(f"CREX schedule fetch error: {e}")
-
-    # Method 3: Open ESPN Web API Fallback (Never blocked by cloud datacenters)
-    if not upcoming:
-        try:
-            espn_url = "https://site.web.api.espn.com/apis/site/v2/sports/cricket/scorepanel"
-            r = requests.get(espn_url, headers=HEADERS, timeout=6).json()
-            for league in r.get("leagues", []):
-                for event in league.get("events", []):
-                    c_title = event.get("name", "")
-                    c_series = league.get("name", "T20")
-                    combined = f"{c_title} {c_series}".upper()
-                    if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
-                        if c_title not in seen:
-                            seen.add(c_title)
-                            status_desc = event.get("status", {}).get("type", {}).get("detail", "Scheduled")
-                            upcoming.append({
-                                "title": c_title,
-                                "series": c_series,
-                                "status_text": status_desc
-                            })
-        except Exception as ee:
-            print(f"ESPN web fallback error: {ee}")
 
     return upcoming
 
 # ===================================================
-# 3. BACKGROUND CRON ENGINE
+# 3. BACKGROUND CRON ENGINE (/poll)
 # ===================================================
 def automated_background_engine():
     users = supabase.table("bot_users").select("*").execute().data
@@ -227,6 +227,7 @@ def automated_background_engine():
         bankroll = int(u["bankroll"])
         autopilot = u.get("auto_pilot", False)
 
+        # A. Check open trades against live odds
         open_trades = supabase.table("trades").select("*").eq("chat_id", chat_id).eq("status", "OPEN").execute().data
         for trade in open_trades:
             t_id = trade["id"]
@@ -244,6 +245,7 @@ def automated_background_engine():
                 if not cur_price or cur_price <= 1.0:
                     continue
 
+                # GREEN BOOK TARGET REACHED
                 if cur_price <= target_lay:
                     alert_key = f"HEDGE_TRIGGER_{t_id}_{cur_price}"
                     if not is_alert_sent(alert_key):
@@ -261,6 +263,7 @@ def automated_background_engine():
                         send_message(chat_id, msg)
                         mark_alert_sent(alert_key)
 
+                # DEFENSIVE CUT-LOSS LIMIT
                 elif cur_price >= stop_loss and stop_loss > 0:
                     alert_key = f"CUTLOSS_TRIGGER_{t_id}"
                     if not is_alert_sent(alert_key):
@@ -281,6 +284,7 @@ def automated_background_engine():
                         send_message(chat_id, msg, reply_markup=keyboard)
                         mark_alert_sent(alert_key)
 
+        # B. Automated Value Swing Detection (Overs 3-15: 2.10 to 2.50)
         if len(open_trades) < 2:
             for cm in crex_matches:
                 for team_key, odds in [(cm["team1"], cm["team1_odds"]), (cm["team2"], cm["team2_odds"])]:
@@ -345,6 +349,7 @@ def cron_poll():
 async def telegram_webhook(request: Request):
     data = await request.json()
 
+    # Handle Inline Keyboard Buttons
     if "callback_query" in data:
         cq = data["callback_query"]
         chat_id = cq["from"]["id"]
@@ -402,6 +407,7 @@ async def telegram_webhook(request: Request):
     chat_id = msg["chat"]["id"]
     text = msg.get("text", "").strip()
 
+    # /start
     if text == "/start":
         user_res = supabase.table("bot_users").select("*").eq("chat_id", chat_id).execute()
         if not user_res.data:
@@ -422,6 +428,7 @@ async def telegram_webhook(request: Request):
             "*Commands:*\n"
             "`/upcoming` — Multi-day T20 & WBBL schedule (CREX)\n"
             "`/live` — Live CREX match odds\n"
+            "`/calc <Runs> <Wkts> <Overs> <Target>` — 120-ball odds engine\n"
             "`/autopilot` — Toggle auto-trade logging\n"
             "`/trade <Team> <Odds> <Match>` — Manual swing entry\n"
             "`/jackpot <Team> <Odds> <Match>` — Manual micro-stake entry\n"
@@ -433,6 +440,7 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, welcome)
         return {"ok": True}
 
+    # /upcoming
     if text == "/upcoming":
         send_message(chat_id, "📅 *Fetching schedule from CREX...*")
         upcoming = fetch_upcoming_t20_schedule()
@@ -445,11 +453,12 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, report)
         return {"ok": True}
 
+    # /live
     if text == "/live":
         send_message(chat_id, "📡 *Scanning live CREX match odds...*")
         crex_data = fetch_crex_live_data()
         if not crex_data:
-            send_message(chat_id, "No live T20 match in progress on CREX right now.\n(Hobart Hurricanes vs Melbourne Renegades starts tomorrow at 8:10 AM / 1:40 PM IST).\n\nUse `/upcoming` to view the full fixture list.")
+            send_message(chat_id, "No live T20 match in progress on CREX right now.\n\nUse `/upcoming` to view the full fixture list.")
             return {"ok": True}
 
         report = "🏏 *Live CREX Matches & Odds:*\n\n"
@@ -463,12 +472,64 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, report)
         return {"ok": True}
 
+    # /calc
+    if text.startswith("/calc"):
+        parts = text.split()
+        if len(parts) != 5:
+            send_message(chat_id, "⚠️ *Format:* `/calc <Runs> <Wickets> <Overs> <Target>`\n*Example:* `/calc 110 3 13.2 165`")
+            return {"ok": True}
+
+        try:
+            r = int(parts[1])
+            w = int(parts[2])
+            ov = float(parts[3])
+            target = int(parts[4])
+        except ValueError:
+            send_message(chat_id, "Please enter valid numbers.")
+            return {"ok": True}
+
+        prob, odds = calculate_internal_t20_odds(r, w, ov, target)
+        completed_ov = int(ov)
+        balls_done = completed_ov * 6 + int(round((ov - completed_ov) * 10))
+        balls_left = max(1, 120 - balls_done)
+        rrr = round(((target - r) / balls_left) * 6, 2)
+
+        card = (
+            f"🧠 *T20 QUANTITATIVE MODEL*\n\n"
+            f"• *State:* {r}/{w} in {ov} overs ({balls_left} balls left)\n"
+            f"• *Target:* {target} (Needs {target - r} runs)\n"
+            f"• *Required Run Rate:* {rrr} RPO\n"
+            f"─────────────────────────\n"
+            f"📊 *Chasing Win Probability:* {prob}%\n"
+            f"📈 *Synthetic Decimal Odds:* {odds}\n\n"
+        )
+        if ov >= 16.0 and odds >= 4.50:
+            card += "🎰 *Signal:* Death Overs Jackpot Candidate (1% Micro-Stake)!"
+        elif 2.10 <= odds <= 2.50 and ov < 16.0:
+            card += "⚡ *Signal:* Standard Swing Zone (5% Stake)!"
+        else:
+            card += "⚪ *Signal:* Normal variance. Standing by."
+
+        send_message(chat_id, card)
+        return {"ok": True}
+
+    # /autopilot
+    if text == "/autopilot":
+        user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
+        new_val = not user.get("auto_pilot", False)
+        supabase.table("bot_users").update({"auto_pilot": new_val}).eq("chat_id", chat_id).execute()
+        status_label = "ENABLED (Auto-take signals)" if new_val else "DISABLED (Manual Yes/No buttons)"
+        send_message(chat_id, f"⚡ *Auto-Pilot Mode:* {status_label}")
+        return {"ok": True}
+
+    # /balance
     if text == "/balance":
         user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
         bankroll = int(user["bankroll"])
         send_message(chat_id, f"💰 *Current Virtual Bankroll:* ₹{bankroll}\n• Swing Stake (5%): ₹{int(bankroll * 0.05)}\n• Jackpot Stake (1%): ₹{int(bankroll * 0.01)}")
         return {"ok": True}
 
+    # /active
     if text == "/active":
         open_trades = supabase.table("trades").select("*").eq("chat_id", chat_id).eq("status", "OPEN").execute().data
         if not open_trades:
@@ -486,6 +547,7 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, report)
         return {"ok": True}
 
+    # /trade
     if text.startswith("/trade"):
         parts = text.split(" ", 3)
         if len(parts) < 4:
@@ -547,6 +609,71 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, card, reply_markup=keyboard)
         return {"ok": True}
 
+    # /jackpot
+    if text.startswith("/jackpot"):
+        parts = text.split(" ", 3)
+        if len(parts) < 4:
+            send_message(chat_id, "⚠️ *Format:* `/jackpot <Team> <Odds> <MatchTitle>`\n*Example:* `/jackpot MR 7.50 Hurricanes vs Renegades`")
+            return {"ok": True}
+
+        team = parts[1].upper()
+        try:
+            back_odds = float(parts[2])
+        except ValueError:
+            send_message(chat_id, "Enter valid decimal odds.")
+            return {"ok": True}
+        match_title = parts[3]
+
+        active_count = len(supabase.table("trades").select("id").eq("chat_id", chat_id).eq("status", "OPEN").execute().data)
+        if active_count >= 2:
+            send_message(chat_id, "🛑 *Limit Reached:* Max 2 concurrent trades allowed.")
+            return {"ok": True}
+
+        user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
+        bankroll = int(user["bankroll"])
+        stake = int(bankroll * 0.01)
+        if stake < 50:
+            stake = 50
+
+        target_lay = round(back_odds * 0.40, 2)
+        stop_loss = round(back_odds * 1.60, 2)
+
+        inserted = supabase.table("trades").insert({
+            "chat_id": chat_id,
+            "match_title": match_title,
+            "team_name": team,
+            "back_odds": back_odds,
+            "back_stake": stake,
+            "target_lay_odds": target_lay,
+            "stop_loss_odds": stop_loss,
+            "trade_type": "JACKPOT",
+            "status": "OPEN" if user["auto_pilot"] else "PENDING",
+            "entry_reason": f"Death overs jackpot on {team} @ {back_odds}."
+        }).execute().data[0]
+
+        card = (
+            f"🎰 *T20 DEATH OVERS JACKPOT (ID #{inserted['id']})*\n\n"
+            f"• *Match:* {match_title}\n"
+            f"• *Action:* BACK (Lagai) *{team}*\n"
+            f"• *Cheap Entry Odds:* {back_odds}\n"
+            f"• *Micro Stake:* ₹{stake} (1% Bankroll)\n"
+            f"• *Target Lay (Green Book):* {target_lay}\n\n"
+            f"🧠 *Reason:* High R:R late-phase setup. Capped ₹{stake} risk."
+        )
+
+        if user["auto_pilot"]:
+            send_message(chat_id, card + "\n\n⚡ *Auto-Pilot:* Trade logged as OPEN.")
+        else:
+            keyboard = {
+                "inline_keyboard": [[
+                    {"text": "✅ Took Trade", "callback_data": f"ACCEPT_{inserted['id']}"},
+                    {"text": "❌ Skip", "callback_data": f"SKIP_{inserted['id']}"}
+                ]]
+            }
+            send_message(chat_id, card, reply_markup=keyboard)
+        return {"ok": True}
+
+    # /hedge
     if text.startswith("/hedge"):
         parts = text.split()
         if len(parts) != 3:
@@ -600,6 +727,7 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, settlement_msg)
         return {"ok": True}
 
+    # /cutloss
     if text.startswith("/cutloss"):
         parts = text.split()
         if len(parts) != 3:
