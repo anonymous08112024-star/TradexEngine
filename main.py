@@ -134,7 +134,7 @@ def fetch_crex_live_data():
     return matches
 
 # ===================================================
-# 2. BOUNDED CREX SCHEDULE SCRAPER (UPCOMING FIXTURES)
+# 2. 3-LAYER SCHEDULE ENGINE (UPCOMING WBBL & T20s)
 # ===================================================
 def fetch_upcoming_t20_schedule():
     url = "https://crex.com/schedule"
@@ -148,67 +148,131 @@ def fetch_upcoming_t20_schedule():
         resp = requests.get(url, headers=HEADERS, timeout=8)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
-            next_script = soup.find("script", id="__NEXT_DATA__")
             
+            # --- LAYER 1: Deep JSON Traversal across all team key aliases ---
+            next_script = soup.find("script", id="__NEXT_DATA__")
             if next_script and next_script.string:
-                data = json.loads(next_script.string)
-                page_props = data.get("props", {}).get("pageProps", {})
-
-                def find_match_cards(node):
-                    cards = []
-                    if isinstance(node, dict):
-                        has_t1 = "team1" in node or "team1Name" in node
-                        has_t2 = "team2" in node or "team2Name" in node
-                        if has_t1 and has_t2:
-                            cards.append(node)
-                        else:
-                            for v in node.values():
-                                cards.extend(find_match_cards(v))
-                    elif isinstance(node, list):
-                        for item in node:
-                            cards.extend(find_match_cards(item))
-                    return cards
-
-                raw_cards = find_match_cards(page_props)
-
-                for card in raw_cards:
-                    t1_obj = card.get("team1")
-                    t2_obj = card.get("team2")
+                try:
+                    data = json.loads(next_script.string)
                     
-                    t1 = card.get("team1Name") or (t1_obj.get("name") if isinstance(t1_obj, dict) else t1_obj)
-                    t2 = card.get("team2Name") or (t2_obj.get("name") if isinstance(t2_obj, dict) else t2_obj)
-                    
-                    if not t1 or not t2 or str(t1).strip() == str(t2).strip():
-                        continue
+                    def traverse_node(node):
+                        found = []
+                        if isinstance(node, dict):
+                            t1, t2 = None, None
+                            
+                            # Search for Team 1 aliases
+                            for k in ["team1Name", "team1", "t1Name", "t1", "teamA", "teamAName", "homeTeam"]:
+                                if k in node:
+                                    v = node[k]
+                                    if isinstance(v, str) and v.strip():
+                                        t1 = v.strip()
+                                        break
+                                    elif isinstance(v, dict):
+                                        for sub_k in ["name", "teamName", "n", "title"]:
+                                            if sub_k in v and isinstance(v[sub_k], str) and v[sub_k].strip():
+                                                t1 = v[sub_k].strip()
+                                                break
+                                if t1:
+                                    break
 
-                    t1 = str(t1).strip()
-                    t2 = str(t2).strip()
+                            # Search for Team 2 aliases
+                            for k in ["team2Name", "team2", "t2Name", "t2", "teamB", "teamBName", "awayTeam"]:
+                                if k in node:
+                                    v = node[k]
+                                    if isinstance(v, str) and v.strip():
+                                        t2 = v.strip()
+                                        break
+                                    elif isinstance(v, dict):
+                                        for sub_k in ["name", "teamName", "n", "title"]:
+                                            if sub_k in v and isinstance(v[sub_k], str) and v[sub_k].strip():
+                                                t2 = v[sub_k].strip()
+                                                break
+                                if t2:
+                                    break
 
-                    series = str(card.get("seriesName") or card.get("series") or "T20 Match").strip()
-                    m_format = str(card.get("format") or card.get("matchType") or "").strip()
-                    status = str(card.get("statusText") or card.get("startTime") or card.get("startDate") or "Scheduled").strip()
+                            # Both teams MUST be present in this exact same node
+                            if t1 and t2 and t1.lower() != t2.lower() and len(t1) < 40 and len(t2) < 40:
+                                if not any(c in t1 for c in ["{", "}", "[", "]"]):
+                                    series = str(node.get("seriesName") or node.get("series") or node.get("tournamentName") or "T20 League").strip()
+                                    m_format = str(node.get("format") or node.get("matchType") or "").strip()
+                                    status = str(node.get("statusText") or node.get("startTime") or node.get("startDate") or "Scheduled").strip()
+                                    
+                                    t1 = re.sub(r"^[,\s]+", "", t1)
+                                    t2 = re.sub(r"^[,\s]+", "", t2)
+                                    series = re.sub(r"^[,\s]+", "", series)
+                                    
+                                    combined = f"{t1} {t2} {series} {m_format}".upper()
+                                    if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
+                                        found.append({
+                                            "title": f"{t1} vs {t2}",
+                                            "series": series,
+                                            "status_text": status
+                                        })
 
-                    combined = f"{t1} {t2} {series} {m_format}".upper()
-                    
-                    if any(ex in combined for ex in exclusions):
-                        continue
-                    if not any(kw in combined for kw in t20_whitelist):
-                        continue
+                            # Continue recursing into children
+                            for val in node.values():
+                                found.extend(traverse_node(val))
 
-                    t1 = re.sub(r"^[,\s]+", "", t1)
-                    t2 = re.sub(r"^[,\s]+", "", t2)
-                    series = re.sub(r"^[,\s]+", "", series)
+                        elif isinstance(node, list):
+                            for item in node:
+                                found.extend(traverse_node(item))
+                        return found
 
-                    match_title = f"{t1} vs {t2}"
-                    if match_title not in seen:
-                        seen.add(match_title)
-                        upcoming.append({
-                            "title": match_title,
-                            "series": series,
-                            "status_text": status
-                        })
+                    extracted = traverse_node(data.get("props", {}).get("pageProps", {}))
+                    for m in extracted:
+                        if m["title"] not in seen:
+                            seen.add(m["title"])
+                            upcoming.append(m)
+                except Exception as je:
+                    print(f"JSON traversal error: {je}")
+
+            # --- LAYER 2: Isolated Match Card Links (href with -vs-) ---
+            if not upcoming:
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].lower()
+                    if ("/scoreboard/" in href or "/live-score/" in href or "/match/" in href) and "-vs-" in href:
+                        slug = [p for p in href.split("/") if "-vs-" in p]
+                        if slug:
+                            parts = slug[0].split("-vs-")
+                            raw_t1 = parts[0].replace("-", " ").strip().title()
+                            raw_t2 = parts[1].split("-202")[0].split("-match")[0].replace("-", " ").strip().title()
+                            
+                            card_text = a.get_text(separator=" ").strip()
+                            combined = f"{raw_t1} {raw_t2} {card_text}".upper()
+                            
+                            if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
+                                m_title = f"{raw_t1} vs {raw_t2}"
+                                if m_title not in seen:
+                                    seen.add(m_title)
+                                    upcoming.append({
+                                        "title": m_title,
+                                        "series": "WBBL / T20",
+                                        "status_text": "Scheduled"
+                                    })
     except Exception as e:
-        print(f"CREX schedule fetch error: {e}")
+        print(f"CREX fetch error: {e}")
+
+    # --- LAYER 3: ESPN Public Web CDN Fallback ---
+    if not upcoming:
+        try:
+            espn_url = "https://site.web.api.espn.com/apis/site/v2/sports/cricket/scorepanel"
+            r = requests.get(espn_url, headers=HEADERS, timeout=6).json()
+            for league in r.get("leagues", []):
+                for event in league.get("events", []):
+                    c_title = event.get("name", "")
+                    c_series = league.get("name", "T20")
+                    combined = f"{c_title} {c_series}".upper()
+                    if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
+                        if c_title not in seen:
+                            seen.add(c_title)
+                            status_desc = event.get("status", {}).get("type", {}).get("detail", "Scheduled")
+                            upcoming.append({
+                                "title": c_title,
+                                "series": c_series,
+                                "status_text": status_desc
+                            })
+        except Exception as ee:
+            print(f"ESPN web fallback error: {ee}")
 
     return upcoming
 
@@ -227,7 +291,6 @@ def automated_background_engine():
         bankroll = int(u["bankroll"])
         autopilot = u.get("auto_pilot", False)
 
-        # A. Check open trades against live odds
         open_trades = supabase.table("trades").select("*").eq("chat_id", chat_id).eq("status", "OPEN").execute().data
         for trade in open_trades:
             t_id = trade["id"]
@@ -245,7 +308,6 @@ def automated_background_engine():
                 if not cur_price or cur_price <= 1.0:
                     continue
 
-                # GREEN BOOK TARGET REACHED
                 if cur_price <= target_lay:
                     alert_key = f"HEDGE_TRIGGER_{t_id}_{cur_price}"
                     if not is_alert_sent(alert_key):
@@ -263,7 +325,6 @@ def automated_background_engine():
                         send_message(chat_id, msg)
                         mark_alert_sent(alert_key)
 
-                # DEFENSIVE CUT-LOSS LIMIT
                 elif cur_price >= stop_loss and stop_loss > 0:
                     alert_key = f"CUTLOSS_TRIGGER_{t_id}"
                     if not is_alert_sent(alert_key):
@@ -284,7 +345,6 @@ def automated_background_engine():
                         send_message(chat_id, msg, reply_markup=keyboard)
                         mark_alert_sent(alert_key)
 
-        # B. Automated Value Swing Detection (Overs 3-15: 2.10 to 2.50)
         if len(open_trades) < 2:
             for cm in crex_matches:
                 for team_key, odds in [(cm["team1"], cm["team1_odds"]), (cm["team2"], cm["team2_odds"])]:
@@ -349,7 +409,6 @@ def cron_poll():
 async def telegram_webhook(request: Request):
     data = await request.json()
 
-    # Handle Inline Keyboard Buttons
     if "callback_query" in data:
         cq = data["callback_query"]
         chat_id = cq["from"]["id"]
@@ -407,7 +466,6 @@ async def telegram_webhook(request: Request):
     chat_id = msg["chat"]["id"]
     text = msg.get("text", "").strip()
 
-    # /start
     if text == "/start":
         user_res = supabase.table("bot_users").select("*").eq("chat_id", chat_id).execute()
         if not user_res.data:
@@ -440,7 +498,6 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, welcome)
         return {"ok": True}
 
-    # /upcoming
     if text == "/upcoming":
         send_message(chat_id, "📅 *Fetching schedule from CREX...*")
         upcoming = fetch_upcoming_t20_schedule()
@@ -453,7 +510,6 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, report)
         return {"ok": True}
 
-    # /live
     if text == "/live":
         send_message(chat_id, "📡 *Scanning live CREX match odds...*")
         crex_data = fetch_crex_live_data()
@@ -472,7 +528,6 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, report)
         return {"ok": True}
 
-    # /calc
     if text.startswith("/calc"):
         parts = text.split()
         if len(parts) != 5:
@@ -513,7 +568,6 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, card)
         return {"ok": True}
 
-    # /autopilot
     if text == "/autopilot":
         user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
         new_val = not user.get("auto_pilot", False)
@@ -522,14 +576,12 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, f"⚡ *Auto-Pilot Mode:* {status_label}")
         return {"ok": True}
 
-    # /balance
     if text == "/balance":
         user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
         bankroll = int(user["bankroll"])
         send_message(chat_id, f"💰 *Current Virtual Bankroll:* ₹{bankroll}\n• Swing Stake (5%): ₹{int(bankroll * 0.05)}\n• Jackpot Stake (1%): ₹{int(bankroll * 0.01)}")
         return {"ok": True}
 
-    # /active
     if text == "/active":
         open_trades = supabase.table("trades").select("*").eq("chat_id", chat_id).eq("status", "OPEN").execute().data
         if not open_trades:
@@ -547,7 +599,6 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, report)
         return {"ok": True}
 
-    # /trade
     if text.startswith("/trade"):
         parts = text.split(" ", 3)
         if len(parts) < 4:
@@ -609,7 +660,6 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, card, reply_markup=keyboard)
         return {"ok": True}
 
-    # /jackpot
     if text.startswith("/jackpot"):
         parts = text.split(" ", 3)
         if len(parts) < 4:
@@ -673,7 +723,6 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, card, reply_markup=keyboard)
         return {"ok": True}
 
-    # /hedge
     if text.startswith("/hedge"):
         parts = text.split()
         if len(parts) != 3:
@@ -727,7 +776,6 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, settlement_msg)
         return {"ok": True}
 
-    # /cutloss
     if text.startswith("/cutloss"):
         parts = text.split()
         if len(parts) != 3:
