@@ -134,7 +134,7 @@ def fetch_crex_live_data():
     return matches
 
 # ===================================================
-# 2. 3-LAYER SCHEDULE ENGINE (UPCOMING WBBL & T20s)
+# 2. ACCURATE BOUNDED SCHEDULE ENGINE (WBBL & T20)
 # ===================================================
 def fetch_upcoming_t20_schedule():
     url = "https://crex.com/schedule"
@@ -149,130 +149,105 @@ def fetch_upcoming_t20_schedule():
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
             
-            # --- LAYER 1: Deep JSON Traversal across all team key aliases ---
-            next_script = soup.find("script", id="__NEXT_DATA__")
-            if next_script and next_script.string:
-                try:
-                    data = json.loads(next_script.string)
-                    
-                    def traverse_node(node):
-                        found = []
-                        if isinstance(node, dict):
-                            t1, t2 = None, None
-                            
-                            # Search for Team 1 aliases
-                            for k in ["team1Name", "team1", "t1Name", "t1", "teamA", "teamAName", "homeTeam"]:
-                                if k in node:
-                                    v = node[k]
-                                    if isinstance(v, str) and v.strip():
-                                        t1 = v.strip()
+            # METHOD 1: Isolated <a> tags (Self-contained match cards)
+            for a in soup.find_all("a"):
+                a_text = a.get_text(separator="\n")
+                lines = [l.strip() for l in a_text.splitlines() if l.strip()]
+                
+                if 3 <= len(lines) <= 12:
+                    full_text = " ".join(lines).upper()
+                    if any(kw in full_text for kw in t20_whitelist) and not any(ex in full_text for ex in exclusions):
+                        series_idx = -1
+                        for idx, l in enumerate(lines):
+                            if any(kw in l.upper() for kw in t20_whitelist) and not any(ex in l.upper() for ex in exclusions):
+                                series_idx = idx
+                                break
+                        
+                        if series_idx != -1:
+                            series_name = lines[series_idx].lstrip(", ")
+                            candidates = [
+                                l for i, l in enumerate(lines) 
+                                if i != series_idx 
+                                and len(l) < 35 
+                                and not any(tk in l.upper() for tk in ["STARTS", "AM", "PM", "LIVE", "TOMORROW", "TODAY", "2026", "NOV", "DEC", "JAN", "T20", "SERIES"])
+                            ]
+                            if len(candidates) >= 2:
+                                t1 = candidates[0].lstrip(", ")
+                                t2 = candidates[1].lstrip(", ")
+                                time_cand = "Scheduled"
+                                for l in lines:
+                                    if any(tk in l.upper() for tk in ["STARTS", "AM", "PM", "TOMORROW", "TODAY"]):
+                                        time_cand = l
                                         break
-                                    elif isinstance(v, dict):
-                                        for sub_k in ["name", "teamName", "n", "title"]:
-                                            if sub_k in v and isinstance(v[sub_k], str) and v[sub_k].strip():
-                                                t1 = v[sub_k].strip()
-                                                break
-                                if t1:
-                                    break
-
-                            # Search for Team 2 aliases
-                            for k in ["team2Name", "team2", "t2Name", "t2", "teamB", "teamBName", "awayTeam"]:
-                                if k in node:
-                                    v = node[k]
-                                    if isinstance(v, str) and v.strip():
-                                        t2 = v.strip()
-                                        break
-                                    elif isinstance(v, dict):
-                                        for sub_k in ["name", "teamName", "n", "title"]:
-                                            if sub_k in v and isinstance(v[sub_k], str) and v[sub_k].strip():
-                                                t2 = v[sub_k].strip()
-                                                break
-                                if t2:
-                                    break
-
-                            # Both teams MUST be present in this exact same node
-                            if t1 and t2 and t1.lower() != t2.lower() and len(t1) < 40 and len(t2) < 40:
-                                if not any(c in t1 for c in ["{", "}", "[", "]"]):
-                                    series = str(node.get("seriesName") or node.get("series") or node.get("tournamentName") or "T20 League").strip()
-                                    m_format = str(node.get("format") or node.get("matchType") or "").strip()
-                                    status = str(node.get("statusText") or node.get("startTime") or node.get("startDate") or "Scheduled").strip()
-                                    
-                                    t1 = re.sub(r"^[,\s]+", "", t1)
-                                    t2 = re.sub(r"^[,\s]+", "", t2)
-                                    series = re.sub(r"^[,\s]+", "", series)
-                                    
-                                    combined = f"{t1} {t2} {series} {m_format}".upper()
-                                    if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
-                                        found.append({
-                                            "title": f"{t1} vs {t2}",
-                                            "series": series,
-                                            "status_text": status
-                                        })
-
-                            # Continue recursing into children
-                            for val in node.values():
-                                found.extend(traverse_node(val))
-
-                        elif isinstance(node, list):
-                            for item in node:
-                                found.extend(traverse_node(item))
-                        return found
-
-                    extracted = traverse_node(data.get("props", {}).get("pageProps", {}))
-                    for m in extracted:
-                        if m["title"] not in seen:
-                            seen.add(m["title"])
-                            upcoming.append(m)
-                except Exception as je:
-                    print(f"JSON traversal error: {je}")
-
-            # --- LAYER 2: Isolated Match Card Links (href with -vs-) ---
-            if not upcoming:
-                for a in soup.find_all("a", href=True):
-                    href = a["href"].lower()
-                    if ("/scoreboard/" in href or "/live-score/" in href or "/match/" in href) and "-vs-" in href:
-                        slug = [p for p in href.split("/") if "-vs-" in p]
-                        if slug:
-                            parts = slug[0].split("-vs-")
-                            raw_t1 = parts[0].replace("-", " ").strip().title()
-                            raw_t2 = parts[1].split("-202")[0].split("-match")[0].replace("-", " ").strip().title()
-                            
-                            card_text = a.get_text(separator=" ").strip()
-                            combined = f"{raw_t1} {raw_t2} {card_text}".upper()
-                            
-                            if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
-                                m_title = f"{raw_t1} vs {raw_t2}"
-                                if m_title not in seen:
-                                    seen.add(m_title)
+                                
+                                title = f"{t1} vs {t2}"
+                                if title not in seen and t1.lower() != t2.lower():
+                                    seen.add(title)
                                     upcoming.append({
-                                        "title": m_title,
-                                        "series": "WBBL / T20",
-                                        "status_text": "Scheduled"
+                                        "title": title,
+                                        "series": series_name,
+                                        "status_text": time_cand
+                                    })
+
+            # METHOD 2: Accurate Reverse-Offset Line Traversal
+            if not upcoming:
+                text_content = soup.get_text(separator="\n")
+                lines = [line.strip() for line in text_content.splitlines() if line.strip()]
+                
+                for i in range(len(lines)):
+                    curr = lines[i].upper()
+                    if any(kw in curr for kw in t20_whitelist) and not any(ex in curr for ex in exclusions):
+                        series_tag = lines[i].lstrip(", ")
+                        
+                        # In CREX layout: lines[i-2]=Team 1, lines[i-1]=Team 2, lines[i]=Series, lines[i+1]=Time
+                        if i >= 2 and (i + 1) < len(lines):
+                            t1 = lines[i-2].lstrip(", ")
+                            t2 = lines[i-1].lstrip(", ")
+                            time_status = lines[i+1]
+                            
+                            bad_keywords = ["STARTS", "AM", "PM", "NOV", "TODAY", "TOMORROW", "LIVE", "2026", "T20", "ODI", "SERIES", "CRICKET", "SCHEDULE"]
+                            is_valid_t1 = len(t1) < 35 and not any(bk in t1.upper() for bk in bad_keywords)
+                            is_valid_t2 = len(t2) < 35 and not any(bk in t2.upper() for bk in bad_keywords)
+                            is_valid_time = any(tk in time_status.upper() for tk in ["AM", "PM", "STARTS", "TOMORROW", "TODAY", "NOV"])
+                            
+                            if is_valid_t1 and is_valid_t2 and is_valid_time and t1.lower() != t2.lower():
+                                title = f"{t1} vs {t2}"
+                                if title not in seen:
+                                    seen.add(title)
+                                    upcoming.append({
+                                        "title": title,
+                                        "series": series_tag,
+                                        "status_text": time_status
                                     })
     except Exception as e:
-        print(f"CREX fetch error: {e}")
+        print(f"CREX schedule fetch error: {e}")
 
-    # --- LAYER 3: ESPN Public Web CDN Fallback ---
+    # METHOD 3: Multi-Day Cricinfo Feed Fallback
     if not upcoming:
         try:
-            espn_url = "https://site.web.api.espn.com/apis/site/v2/sports/cricket/scorepanel"
-            r = requests.get(espn_url, headers=HEADERS, timeout=6).json()
-            for league in r.get("leagues", []):
-                for event in league.get("events", []):
-                    c_title = event.get("name", "")
-                    c_series = league.get("name", "T20")
-                    combined = f"{c_title} {c_series}".upper()
+            espn_url = "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/schedule?lang=en"
+            res = requests.get(espn_url, headers=HEADERS, timeout=6).json()
+            days = res.get("content", {}).get("days", [])
+            for d in days:
+                for m in d.get("matches", []):
+                    fmt = str(m.get("format", "")).upper()
+                    s_name = str(m.get("series", {}).get("name", "")).upper()
+                    combined = f"{fmt} {s_name}".upper()
                     if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
-                        if c_title not in seen:
-                            seen.add(c_title)
-                            status_desc = event.get("status", {}).get("type", {}).get("detail", "Scheduled")
-                            upcoming.append({
-                                "title": c_title,
-                                "series": c_series,
-                                "status_text": status_desc
-                            })
+                        teams = m.get("teams", [])
+                        if len(teams) >= 2:
+                            t1 = teams[0].get("team", {}).get("name", "Team 1")
+                            t2 = teams[1].get("team", {}).get("name", "Team 2")
+                            title = f"{t1} vs {t2}"
+                            if title not in seen:
+                                seen.add(title)
+                                upcoming.append({
+                                    "title": title,
+                                    "series": s_name,
+                                    "status_text": m.get("statusText", "Scheduled")
+                                })
         except Exception as ee:
-            print(f"ESPN web fallback error: {ee}")
+            print(f"Fallback schedule error: {ee}")
 
     return upcoming
 
