@@ -12,6 +12,7 @@ app = FastAPI()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -134,122 +135,60 @@ def fetch_crex_live_data():
     return matches
 
 # ===================================================
-# 2. ACCURATE BOUNDED SCHEDULE ENGINE (WBBL & T20)
+# 2. GEMINI AI SCHEDULE ENGINE (100% CLEAN EXTRACTION)
 # ===================================================
 def fetch_upcoming_t20_schedule():
+    """
+    Grabs the raw schedule text from CREX and lets Gemini 2.5 Flash 
+    extract clean match pairs, tournament titles, and start times.
+    """
     url = "https://crex.com/schedule"
-    upcoming = []
-    seen = set()
-
-    t20_whitelist = ["T20", "WBBL", "BBL", "IPL", "WPL", "PSL", "SA20", "CPL", "BLAST", "HUNDRED"]
-    exclusions = ["ODI", "TEST", "FIRST-CLASS", "LIST A", "YOUTH"]
-
+    raw_text = ""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=8)
         if resp.status_code == 200:
             soup = BeautifulSoup(resp.text, "html.parser")
-            
-            # METHOD 1: Isolated <a> tags (Self-contained match cards)
-            for a in soup.find_all("a"):
-                a_text = a.get_text(separator="\n")
-                lines = [l.strip() for l in a_text.splitlines() if l.strip()]
-                
-                if 3 <= len(lines) <= 12:
-                    full_text = " ".join(lines).upper()
-                    if any(kw in full_text for kw in t20_whitelist) and not any(ex in full_text for ex in exclusions):
-                        series_idx = -1
-                        for idx, l in enumerate(lines):
-                            if any(kw in l.upper() for kw in t20_whitelist) and not any(ex in l.upper() for ex in exclusions):
-                                series_idx = idx
-                                break
-                        
-                        if series_idx != -1:
-                            series_name = lines[series_idx].lstrip(", ")
-                            candidates = [
-                                l for i, l in enumerate(lines) 
-                                if i != series_idx 
-                                and len(l) < 35 
-                                and not any(tk in l.upper() for tk in ["STARTS", "AM", "PM", "LIVE", "TOMORROW", "TODAY", "2026", "NOV", "DEC", "JAN", "T20", "SERIES"])
-                            ]
-                            if len(candidates) >= 2:
-                                t1 = candidates[0].lstrip(", ")
-                                t2 = candidates[1].lstrip(", ")
-                                time_cand = "Scheduled"
-                                for l in lines:
-                                    if any(tk in l.upper() for tk in ["STARTS", "AM", "PM", "TOMORROW", "TODAY"]):
-                                        time_cand = l
-                                        break
-                                
-                                title = f"{t1} vs {t2}"
-                                if title not in seen and t1.lower() != t2.lower():
-                                    seen.add(title)
-                                    upcoming.append({
-                                        "title": title,
-                                        "series": series_name,
-                                        "status_text": time_cand
-                                    })
-
-            # METHOD 2: Accurate Reverse-Offset Line Traversal
-            if not upcoming:
-                text_content = soup.get_text(separator="\n")
-                lines = [line.strip() for line in text_content.splitlines() if line.strip()]
-                
-                for i in range(len(lines)):
-                    curr = lines[i].upper()
-                    if any(kw in curr for kw in t20_whitelist) and not any(ex in curr for ex in exclusions):
-                        series_tag = lines[i].lstrip(", ")
-                        
-                        # In CREX layout: lines[i-2]=Team 1, lines[i-1]=Team 2, lines[i]=Series, lines[i+1]=Time
-                        if i >= 2 and (i + 1) < len(lines):
-                            t1 = lines[i-2].lstrip(", ")
-                            t2 = lines[i-1].lstrip(", ")
-                            time_status = lines[i+1]
-                            
-                            bad_keywords = ["STARTS", "AM", "PM", "NOV", "TODAY", "TOMORROW", "LIVE", "2026", "T20", "ODI", "SERIES", "CRICKET", "SCHEDULE"]
-                            is_valid_t1 = len(t1) < 35 and not any(bk in t1.upper() for bk in bad_keywords)
-                            is_valid_t2 = len(t2) < 35 and not any(bk in t2.upper() for bk in bad_keywords)
-                            is_valid_time = any(tk in time_status.upper() for tk in ["AM", "PM", "STARTS", "TOMORROW", "TODAY", "NOV"])
-                            
-                            if is_valid_t1 and is_valid_t2 and is_valid_time and t1.lower() != t2.lower():
-                                title = f"{t1} vs {t2}"
-                                if title not in seen:
-                                    seen.add(title)
-                                    upcoming.append({
-                                        "title": title,
-                                        "series": series_tag,
-                                        "status_text": time_status
-                                    })
+            raw_text = soup.get_text(separator="\n")
     except Exception as e:
-        print(f"CREX schedule fetch error: {e}")
+        print(f"CREX fetch error: {e}")
 
-    # METHOD 3: Multi-Day Cricinfo Feed Fallback
-    if not upcoming:
-        try:
-            espn_url = "https://hs-consumer-api.espncricinfo.com/v1/pages/matches/schedule?lang=en"
-            res = requests.get(espn_url, headers=HEADERS, timeout=6).json()
-            days = res.get("content", {}).get("days", [])
-            for d in days:
-                for m in d.get("matches", []):
-                    fmt = str(m.get("format", "")).upper()
-                    s_name = str(m.get("series", {}).get("name", "")).upper()
-                    combined = f"{fmt} {s_name}".upper()
-                    if any(kw in combined for kw in t20_whitelist) and not any(ex in combined for ex in exclusions):
-                        teams = m.get("teams", [])
-                        if len(teams) >= 2:
-                            t1 = teams[0].get("team", {}).get("name", "Team 1")
-                            t2 = teams[1].get("team", {}).get("name", "Team 2")
-                            title = f"{t1} vs {t2}"
-                            if title not in seen:
-                                seen.add(title)
-                                upcoming.append({
-                                    "title": title,
-                                    "series": s_name,
-                                    "status_text": m.get("statusText", "Scheduled")
-                                })
-        except Exception as ee:
-            print(f"Fallback schedule error: {ee}")
+    if not raw_text or not GEMINI_API_KEY:
+        return []
 
-    return upcoming
+    # Clean text to send to Gemini
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    cleaned_chunk = "\n".join(lines[:350])  # Send relevant schedule portion
+
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    prompt = (
+        "Extract all upcoming scheduled T20 cricket matches (specifically WBBL, BBL, IPL, CSA T20, International T20s) "
+        "from this raw text. Return ONLY a valid JSON list of objects with these exact keys:\n"
+        "- 'title': (e.g. 'Hobart Hurricanes Women vs Melbourne Renegades Women')\n"
+        "- 'series': (e.g. 'Women\\'s Big Bash League 2026')\n"
+        "- 'status_text': (e.g. 'Tomorrow, 1:40 PM' or match time)\n\n"
+        "Rules:\n"
+        "1. Never put ordinals like '9th' or '3rd' or times as team names.\n"
+        "2. Exclude ODI, Test, and already completed matches.\n\n"
+        f"TEXT:\n{cleaned_chunk}"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"response_mime_type": "application/json"}
+    }
+
+    try:
+        res = requests.post(gemini_url, json=payload, timeout=10)
+        data = res.json()
+        raw_json_str = data["candidates"][0]["content"]["parts"][0]["text"]
+        matches = json.loads(raw_json_str)
+        if isinstance(matches, list):
+            return matches
+    except Exception as e:
+        print(f"Gemini API parse error: {e}")
+
+    return []
 
 # ===================================================
 # 3. BACKGROUND CRON ENGINE (/poll)
@@ -263,7 +202,7 @@ def automated_background_engine():
 
     for u in users:
         chat_id = u["chat_id"]
-        bankroll = int(u["bankroll"])
+        bankroll = int(u.get("bankroll", 10000))
         autopilot = u.get("auto_pilot", False)
 
         open_trades = supabase.table("trades").select("*").eq("chat_id", chat_id).eq("status", "OPEN").execute().data
@@ -370,7 +309,7 @@ def automated_background_engine():
 
 @app.get("/")
 def health_check():
-    return {"status": "alive", "engine": "CREX_Live_Engine"}
+    return {"status": "alive", "engine": "Tradex_Gemini_Engine"}
 
 @app.get("/poll")
 def cron_poll():
@@ -402,13 +341,14 @@ async def telegram_webhook(request: Request):
         elif cb_data.startswith("EXEC_CUTLOSS_"):
             trade_id = int(cb_data.split("_")[2])
             trade = supabase.table("trades").select("*").eq("id", trade_id).single().execute().data
-            user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
+            user_res = supabase.table("bot_users").select("*").eq("chat_id", chat_id).execute().data
+            current_bankroll = int(user_res[0]["bankroll"]) if user_res else 10000
             
             back_stake = int(trade["back_stake"])
             cur_odds = float(trade["stop_loss_odds"])
             lay_stake, loss_amount, salvaged = calculate_cut_loss(back_stake, float(trade["back_odds"]), cur_odds)
             
-            new_bankroll = int(user["bankroll"]) - loss_amount
+            new_bankroll = current_bankroll - loss_amount
             supabase.table("bot_users").update({"bankroll": new_bankroll}).eq("chat_id", chat_id).execute()
             supabase.table("trades").update({"status": "CUT_LOSS"}).eq("id", trade_id).execute()
             
@@ -441,28 +381,33 @@ async def telegram_webhook(request: Request):
     chat_id = msg["chat"]["id"]
     text = msg.get("text", "").strip()
 
-    if text == "/start":
-        user_res = supabase.table("bot_users").select("*").eq("chat_id", chat_id).execute()
-        if not user_res.data:
-            supabase.table("bot_users").insert({
-                "chat_id": chat_id,
-                "bankroll": 10000,
-                "risk_percent": 5,
-                "auto_pilot": False
-            }).execute()
+    # Ensure user exists in database
+    user_res = supabase.table("bot_users").select("*").eq("chat_id", chat_id).execute().data
+    if not user_res:
+        new_user = {
+            "chat_id": chat_id,
+            "bankroll": 10000,
+            "risk_percent": 5,
+            "auto_pilot": False
+        }
+        supabase.table("bot_users").insert(new_user).execute()
+        current_user = new_user
+    else:
+        current_user = user_res[0]
 
+    # /start
+    if text == "/start":
         welcome = (
-            "🏏 *Tradex CREX Automated Trading Engine*\n\n"
-            "• *Source:* Live CREX Web Feed & Schedule\n"
+            "🏏 *Tradex CREX + Gemini AI Trading Engine*\n\n"
+            "• *Schedule Engine:* Powered by Gemini 2.5 Flash\n"
             "• *Virtual Bankroll:* ₹10,000\n"
             "• *Standard Swing (Overs 3-15):* 5% (₹500)\n"
             "• *Death Overs Jackpot (Overs 16-20):* 1% (₹100)\n"
             "• *Max Active Trades:* 2\n\n"
             "*Commands:*\n"
-            "`/upcoming` — Multi-day T20 & WBBL schedule (CREX)\n"
+            "`/upcoming` — Clean WBBL & T20 fixtures via Gemini AI\n"
             "`/live` — Live CREX match odds\n"
-            "`/calc <Runs> <Wkts> <Overs> <Target>` — 120-ball odds engine\n"
-            "`/autopilot` — Toggle auto-trade logging\n"
+            "`/autopilot` — Toggle auto-trade logging ON/OFF\n"
             "`/trade <Team> <Odds> <Match>` — Manual swing entry\n"
             "`/jackpot <Team> <Odds> <Match>` — Manual micro-stake entry\n"
             "`/hedge <TradeID> <Odds>` — Lock Green Book\n"
@@ -473,18 +418,46 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, welcome)
         return {"ok": True}
 
-    if text == "/upcoming":
-        send_message(chat_id, "📅 *Fetching schedule from CREX...*")
-        upcoming = fetch_upcoming_t20_schedule()
-        if not upcoming:
-            send_message(chat_id, "No scheduled T20 fixtures found.")
+    # /autopilot (Defensive & Clear Feedback)
+    if text == "/autopilot":
+        current_state = bool(current_user.get("auto_pilot", False))
+        new_state = not current_state
+        
+        supabase.table("bot_users").update({"auto_pilot": new_state}).eq("chat_id", chat_id).execute()
+        
+        if new_state:
+            status_msg = (
+                "⚡ *AUTO-PILOT: ACTIVATED (ON)*\n\n"
+                "• The bot will automatically accept and log in-play value swing entries (2.10–2.50).\n"
+                "• No manual confirmation buttons required.\n\n"
+                "Send `/autopilot` anytime to switch back to manual confirmation."
+            )
         else:
-            report = "🏏 *Upcoming Popular T20 Matches (CREX):*\n\n"
-            for m in upcoming[:8]:
-                report += f"• *{m['title']}*\n  🏆 {m['series']}\n  🕒 {m['status_text']}\n\n"
+            status_msg = (
+                "✋ *AUTO-PILOT: DEACTIVATED (OFF)*\n\n"
+                "• The bot will now prompt you with *[✅ Took Trade]* and *[❌ Skip]* buttons before opening any trade.\n\n"
+                "Send `/autopilot` anytime to turn auto-trade logging back ON."
+            )
+        send_message(chat_id, status_msg)
+        return {"ok": True}
+
+    # /upcoming (Gemini-Powered)
+    if text == "/upcoming":
+        send_message(chat_id, "🧠 *Analyzing CREX schedule via Gemini AI...*")
+        matches = fetch_upcoming_t20_schedule()
+        if not matches:
+            send_message(chat_id, "No scheduled T20 fixtures found or unable to parse schedule.")
+        else:
+            report = "🏏 *Upcoming Popular T20 Matches:*\n\n"
+            for m in matches[:8]:
+                title = m.get("title", "")
+                series = m.get("series", "T20 Match")
+                time_str = m.get("status_text", "Scheduled")
+                report += f"• *{title}*\n  🏆 {series}\n  🕒 {time_str}\n\n"
             send_message(chat_id, report)
         return {"ok": True}
 
+    # /live
     if text == "/live":
         send_message(chat_id, "📡 *Scanning live CREX match odds...*")
         crex_data = fetch_crex_live_data()
@@ -503,6 +476,7 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, report)
         return {"ok": True}
 
+    # /calc
     if text.startswith("/calc"):
         parts = text.split()
         if len(parts) != 5:
@@ -543,20 +517,13 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, card)
         return {"ok": True}
 
-    if text == "/autopilot":
-        user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
-        new_val = not user.get("auto_pilot", False)
-        supabase.table("bot_users").update({"auto_pilot": new_val}).eq("chat_id", chat_id).execute()
-        status_label = "ENABLED (Auto-take signals)" if new_val else "DISABLED (Manual Yes/No buttons)"
-        send_message(chat_id, f"⚡ *Auto-Pilot Mode:* {status_label}")
-        return {"ok": True}
-
+    # /balance
     if text == "/balance":
-        user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
-        bankroll = int(user["bankroll"])
+        bankroll = int(current_user.get("bankroll", 10000))
         send_message(chat_id, f"💰 *Current Virtual Bankroll:* ₹{bankroll}\n• Swing Stake (5%): ₹{int(bankroll * 0.05)}\n• Jackpot Stake (1%): ₹{int(bankroll * 0.01)}")
         return {"ok": True}
 
+    # /active
     if text == "/active":
         open_trades = supabase.table("trades").select("*").eq("chat_id", chat_id).eq("status", "OPEN").execute().data
         if not open_trades:
@@ -574,6 +541,7 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, report)
         return {"ok": True}
 
+    # /trade
     if text.startswith("/trade"):
         parts = text.split(" ", 3)
         if len(parts) < 4:
@@ -593,11 +561,11 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, "🛑 *Limit Reached:* Max 2 concurrent trades allowed.")
             return {"ok": True}
 
-        user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
-        bankroll = int(user["bankroll"])
+        bankroll = int(current_user.get("bankroll", 10000))
         stake = int(bankroll * 0.05)
         target_lay = round(back_odds * 0.70, 2)
         stop_loss = round(back_odds * 1.50, 2)
+        autopilot = current_user.get("auto_pilot", False)
 
         inserted = supabase.table("trades").insert({
             "chat_id": chat_id,
@@ -608,7 +576,7 @@ async def telegram_webhook(request: Request):
             "target_lay_odds": target_lay,
             "stop_loss_odds": stop_loss,
             "trade_type": "SWING",
-            "status": "OPEN" if user["auto_pilot"] else "PENDING",
+            "status": "OPEN" if autopilot else "PENDING",
             "entry_reason": f"Manual T20 swing entry on {team} @ {back_odds}."
         }).execute().data[0]
 
@@ -623,7 +591,7 @@ async def telegram_webhook(request: Request):
             f"📊 *Reason:* Target 30% contraction for equalized profit."
         )
 
-        if user["auto_pilot"]:
+        if autopilot:
             send_message(chat_id, card + "\n\n⚡ *Auto-Pilot:* Trade logged as OPEN.")
         else:
             keyboard = {
@@ -635,6 +603,7 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, card, reply_markup=keyboard)
         return {"ok": True}
 
+    # /jackpot
     if text.startswith("/jackpot"):
         parts = text.split(" ", 3)
         if len(parts) < 4:
@@ -654,14 +623,14 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, "🛑 *Limit Reached:* Max 2 concurrent trades allowed.")
             return {"ok": True}
 
-        user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
-        bankroll = int(user["bankroll"])
+        bankroll = int(current_user.get("bankroll", 10000))
         stake = int(bankroll * 0.01)
         if stake < 50:
             stake = 50
 
         target_lay = round(back_odds * 0.40, 2)
         stop_loss = round(back_odds * 1.60, 2)
+        autopilot = current_user.get("auto_pilot", False)
 
         inserted = supabase.table("trades").insert({
             "chat_id": chat_id,
@@ -672,7 +641,7 @@ async def telegram_webhook(request: Request):
             "target_lay_odds": target_lay,
             "stop_loss_odds": stop_loss,
             "trade_type": "JACKPOT",
-            "status": "OPEN" if user["auto_pilot"] else "PENDING",
+            "status": "OPEN" if autopilot else "PENDING",
             "entry_reason": f"Death overs jackpot on {team} @ {back_odds}."
         }).execute().data[0]
 
@@ -686,7 +655,7 @@ async def telegram_webhook(request: Request):
             f"🧠 *Reason:* High R:R late-phase setup. Capped ₹{stake} risk."
         )
 
-        if user["auto_pilot"]:
+        if autopilot:
             send_message(chat_id, card + "\n\n⚡ *Auto-Pilot:* Trade logged as OPEN.")
         else:
             keyboard = {
@@ -698,6 +667,7 @@ async def telegram_webhook(request: Request):
             send_message(chat_id, card, reply_markup=keyboard)
         return {"ok": True}
 
+    # /hedge
     if text.startswith("/hedge"):
         parts = text.split()
         if len(parts) != 3:
@@ -721,8 +691,7 @@ async def telegram_webhook(request: Request):
         back_odds = float(t["back_odds"])
         lay_stake, net_profit = calculate_green_book(back_stake, back_odds, cur_lay_odds)
 
-        user = supabase.table("bot_users").select("*").eq("chat_id", chat_id).single().execute().data
-        new_bankroll = int(user["bankroll"]) + net_profit
+        new_bankroll = int(current_user.get("bankroll", 10000)) + net_profit
 
         supabase.table("bot_users").update({"bankroll": new_bankroll}).eq("chat_id", chat_id).execute()
         supabase.table("trades").update({"status": "HEDGED", "lay_stake": lay_stake, "locked_profit": net_profit}).eq("id", trade_id).execute()
@@ -751,6 +720,7 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, settlement_msg)
         return {"ok": True}
 
+    # /cutloss
     if text.startswith("/cutloss"):
         parts = text.split()
         if len(parts) != 3:
