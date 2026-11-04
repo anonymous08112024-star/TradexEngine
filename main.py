@@ -1,9 +1,6 @@
 import os
-import json
-import re
 import math
 import requests
-from bs4 import BeautifulSoup
 from fastapi import FastAPI, Request
 from supabase import create_client, Client
 
@@ -12,7 +9,6 @@ app = FastAPI()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -21,8 +17,7 @@ EXCHANGE_COMMISSION = 0.02  # 2% exchange commission
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5"
+    "Accept": "application/json"
 }
 
 def send_message(chat_id: int, text: str, reply_markup: dict = None):
@@ -87,145 +82,132 @@ def calculate_internal_t20_odds(runs: int, wickets: int, overs_bowled: float, ta
     return round(win_prob * 100, 1), round(1.0 / win_prob, 2)
 
 # ===================================================
-# 1. LIVE CREX SCRAPER (IN-PLAY DECIMAL ODDS)
+# PIPE 1: ESPN CORE REST API (SCHEDULES & SCOREBOARDS)
 # ===================================================
-def fetch_crex_live_data():
-    url = "https://crex.com/live-score"
-    matches = []
-    t20_whitelist = ["T20", "WBBL", "BBL", "IPL", "WPL", "PSL", "SA20", "CPL", "BLAST", "HUNDRED"]
-    exclusions = ["ODI", "TEST", "FIRST-CLASS", "LIST A"]
-
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=8)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            next_script = soup.find("script", id="__NEXT_DATA__")
-            if next_script and next_script.string:
-                data = json.loads(next_script.string)
-                page_props = data.get("props", {}).get("pageProps", {})
-                live_list = page_props.get("liveMatches", []) or page_props.get("matches", [])
-                
-                for m in live_list:
-                    s_name = str(m.get("seriesName", "")).upper()
-                    m_format = str(m.get("format", "")).upper()
-                    m_title = str(m.get("matchName", "") or m.get("title", "")).upper()
-                    
-                    if any(ex in f"{s_name} {m_format}" for ex in exclusions):
-                        continue
-                    if not any(kw in f"{s_name} {m_format} {m_title}" for kw in t20_whitelist):
-                        continue
-
-                    odds_data = m.get("odds", {}) or m.get("matchOdds", {})
-                    t1_odds = float(odds_data.get("team1Odds") or odds_data.get("t1Odds") or 0.0)
-                    t2_odds = float(odds_data.get("team2Odds") or odds_data.get("t2Odds") or 0.0)
-                    
-                    matches.append({
-                        "id": str(m.get("matchId") or m.get("id")),
-                        "series": m.get("seriesName", "T20 Match"),
-                        "title": f"{m.get('team1', {}).get('name', 'T1')} vs {m.get('team2', {}).get('name', 'T2')}",
-                        "team1": m.get("team1", {}).get("name", "Team 1"),
-                        "team2": m.get("team2", {}).get("name", "Team 2"),
-                        "team1_odds": t1_odds,
-                        "team2_odds": t2_odds,
-                        "status": m.get("statusText", "Live")
-                    })
-    except Exception as e:
-        print(f"CREX live fetch error: {e}")
-
-    return matches
-
-# ===================================================
-# 2. ISOLATED CARD EXTRACTOR + GEMINI AI PARSER
-# ===================================================
-def fetch_upcoming_t20_schedule():
-    url = "https://crex.com/schedule"
-    card_blocks = []
-    
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=8)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            
-            # Extract only clickable match cards (quarantined match boundaries)
-            for a in soup.find_all("a", href=True):
-                txt = " ".join(a.get_text(separator=" ").split())
-                u = txt.upper()
-                
-                # Filter for T20 match cards
-                if any(k in u for k in ["WBBL", "BBL", "T20", "IPL", "WPL", "SUPER SMASH", "CSA T20", "LEAGUE"]) and not any(ex in u for ex in ["TEST", "ODI", "50 OVER"]):
-                    if 25 < len(txt) < 300:
-                        # Exclude navigation headers
-                        if not any(nav in u for nav in ["RANKING", "POINT TABLE", "FANTASY", "NEWS", "SERIES ARCHIVE", "YET TO BAT"]):
-                            if txt not in card_blocks:
-                                card_blocks.append(txt)
-    except Exception as e:
-        print(f"CREX schedule fetch error: {e}")
-
-    if not card_blocks:
-        return []
-
-    # Send isolated cards to Gemini AI
-    if GEMINI_API_KEY:
-        try:
-            formatted_cards = "\n".join([f"Match {i+1}: {card}" for i, card in enumerate(card_blocks[:25])])
-            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-            
-            prompt = (
-                "Each line below is ONE isolated, independent cricket match card. Extract the two real teams playing against each other for each card.\n\n"
-                "Return ONLY a valid JSON list of objects with these keys:\n"
-                "- 'title': 'Team 1 vs Team 2' (e.g., 'Hobart Hurricanes Women vs Melbourne Renegades Women')\n"
-                "- 'series': Tournament name (e.g., 'Women\\'s Big Bash League 2026' or 'CSA T20')\n"
-                "- 'status_text': Match timing or date (e.g., 'Today, 1:40 PM' or 'Thu, 10:10 AM')\n\n"
-                "Strict Rules:\n"
-                "1. Each line is an independent match. NEVER cross-combine teams from different lines.\n"
-                "2. Exclude playoff placeholders like '1st Semi Final', 'Team 1 (TBC)', 'Winner of Match 1'. Only include fixtures where two real team names exist.\n"
-                "3. Remove match ordinals like '9th T20' from team names.\n\n"
-                f"MATCH CARDS:\n{formatted_cards}"
-            )
-
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"response_mime_type": "application/json"}
-            }
-
-            res = requests.post(gemini_url, json=payload, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                raw_json = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                matches = json.loads(raw_json)
-                if isinstance(matches, list) and len(matches) > 0:
-                    return matches
-        except Exception as ge:
-            print(f"Gemini isolated cards error: {ge}")
-
-    # Fallback parser if Gemini is temporarily unavailable
+def fetch_espn_fixtures():
+    """
+    Pulls structured JSON directly from ESPN's public mobile CDN.
+    Zero scraping, 100% clean data, zero API keys.
+    """
+    url = "https://site.web.api.espn.com/apis/site/v2/sports/cricket/scorepanel"
     upcoming = []
+    live_matches = []
     seen = set()
-    for card in card_blocks:
-        clean_card = re.sub(r"\b\d+(st|nd|rd|th)\b", "", card, flags=re.IGNORECASE)
-        tokens = [t.strip() for t in clean_card.split() if len(t.strip()) > 2]
-        if "vs" in clean_card.lower():
-            parts = clean_card.split("vs")
-            t1 = parts[0].split()[-3:] if len(parts[0].split()) >= 3 else parts[0].split()
-            t2 = parts[1].split()[:3] if len(parts[1].split()) >= 3 else parts[1].split()
-            t1_name = " ".join(t1)
-            t2_name = " ".join(t2)
-            title = f"{t1_name} vs {t2_name}"
-            if title not in seen:
-                seen.add(title)
-                upcoming.append({"title": title, "series": "T20 Match", "status_text": "Scheduled"})
 
-    return upcoming
+    t20_whitelist = ["T20", "WBBL", "BBL", "IPL", "WPL", "PSL", "SA20", "CPL", "BLAST", "HUNDRED", "BIG BASH"]
+    exclusions = ["ODI", "TEST", "FIRST-CLASS", "LIST A", "50 OVER"]
+
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=7).json()
+        for league in res.get("leagues", []):
+            series_name = league.get("name", "T20 Match")
+            
+            for event in league.get("events", []):
+                match_id = str(event.get("id", ""))
+                title = event.get("name", "")
+                
+                # Verify T20 format
+                combined = f"{title} {series_name}".upper()
+                if any(ex in combined for ex in exclusions):
+                    continue
+                if not any(kw in combined for kw in t20_whitelist):
+                    continue
+
+                if match_id in seen:
+                    continue
+                seen.add(match_id)
+
+                status_obj = event.get("status", {})
+                state = status_obj.get("type", {}).get("state", "pre").lower()
+                status_desc = status_obj.get("type", {}).get("detail") or status_obj.get("type", {}).get("description") or "Scheduled"
+
+                comps = event.get("competitions", [{}])[0]
+                competitors = comps.get("competitors", [])
+                
+                t1_name = competitors[0].get("team", {}).get("name", "Team 1") if len(competitors) > 0 else "Team 1"
+                t2_name = competitors[1].get("team", {}).get("name", "Team 2") if len(competitors) > 1 else "Team 2"
+                t1_score = competitors[0].get("score", "Yet to bat") if len(competitors) > 0 else ""
+                t2_score = competitors[1].get("score", "Yet to bat") if len(competitors) > 1 else ""
+
+                fixture_data = {
+                    "id": match_id,
+                    "title": f"{t1_name} vs {t2_name}",
+                    "team1": t1_name,
+                    "team2": t2_name,
+                    "team1_score": t1_score,
+                    "team2_score": t2_score,
+                    "series": series_name,
+                    "status_text": status_desc,
+                    "state": state
+                }
+
+                if state == "in":
+                    live_matches.append(fixture_data)
+                elif state == "pre":
+                    upcoming.append(fixture_data)
+
+    except Exception as e:
+        print(f"ESPN Core REST API error: {e}")
+
+    return {"upcoming": upcoming, "live": live_matches}
 
 # ===================================================
-# 3. BACKGROUND CRON ENGINE (/poll)
+# PIPE 2: OPEN IN-PLAY MARKET DECIMAL ODDS FEED
+# ===================================================
+def fetch_live_market_odds():
+    """
+    Pulls unauthenticated real-time decimal odds directly from open 
+    in-play feeds for all active cricket matches globally.
+    """
+    url = "https://1xbet.com/LiveFeed/BestGamesZip?sports=1&count=50&lng=en"
+    live_odds_map = []
+
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=6).json()
+        games = res.get("Value", [])
+        
+        for g in games:
+            t1 = g.get("O1", "")
+            t2 = g.get("O2", "")
+            league = g.get("L", "")
+            events = g.get("E", [])
+            
+            t1_odds = 0.0
+            t2_odds = 0.0
+
+            # Find Match Winner Decimal Odds (Group 1)
+            for ev in events:
+                if ev.get("G") == 1:
+                    if ev.get("T") == 1:
+                        t1_odds = float(ev.get("C", 0.0))
+                    elif ev.get("T") == 2 or ev.get("T") == 3:
+                        t2_odds = float(ev.get("C", 0.0))
+
+            if t1 and t2 and (t1_odds > 1.0 or t2_odds > 1.0):
+                live_odds_map.append({
+                    "title": f"{t1} vs {t2}",
+                    "team1": t1,
+                    "team2": t2,
+                    "series": league,
+                    "team1_odds": t1_odds,
+                    "team2_odds": t2_odds
+                })
+    except Exception as e:
+        print(f"Pipe 2 market feed notice: {e}")
+
+    return live_odds_map
+
+# ===================================================
+# BACKGROUND ENGINE (/poll)
 # ===================================================
 def automated_background_engine():
     users = supabase.table("bot_users").select("*").execute().data
     if not users:
         return
 
-    crex_matches = fetch_crex_live_data()
+    # Ingest from both pipes
+    espn_data = fetch_espn_fixtures()
+    live_odds = fetch_live_market_odds()
 
     for u in users:
         chat_id = u["chat_id"]
@@ -233,39 +215,43 @@ def automated_background_engine():
         autopilot = u.get("auto_pilot", False)
 
         open_trades = supabase.table("trades").select("*").eq("chat_id", chat_id).eq("status", "OPEN").execute().data
+        
+        # 1. Evaluate Open Trades Against Live Odds
         for trade in open_trades:
             t_id = trade["id"]
             target_lay = float(trade["target_lay_odds"])
             stop_loss = float(trade["stop_loss_odds"])
-            t_name = trade["team_name"].upper()
+            team_key = trade["team_name"].upper()
 
-            for cm in crex_matches:
+            for m in live_odds:
                 cur_price = None
-                if t_name in cm["team1"].upper():
-                    cur_price = cm["team1_odds"]
-                elif t_name in cm["team2"].upper():
-                    cur_price = cm["team2_odds"]
+                if team_key in m["team1"].upper():
+                    cur_price = m["team1_odds"]
+                elif team_key in m["team2"].upper():
+                    cur_price = m["team2_odds"]
 
                 if not cur_price or cur_price <= 1.0:
                     continue
 
+                # GREEN BOOK TARGET REACHED
                 if cur_price <= target_lay:
                     alert_key = f"HEDGE_TRIGGER_{t_id}_{cur_price}"
                     if not is_alert_sent(alert_key):
                         lay_stake, net_profit = calculate_green_book(int(trade["back_stake"]), float(trade["back_odds"]), cur_price)
                         msg = (
-                            f"🎯 *TARGET HIT (CREX LIVE): LOCK GREEN BOOK!*\n\n"
+                            f"🎯 *TARGET HIT: LOCK GREEN BOOK NOW!*\n\n"
                             f"• *Match:* {trade['match_title']}\n"
                             f"• *Team:* {trade['team_name']}\n"
-                            f"• *Current CREX Rate:* {cur_price} (Target: {target_lay})\n"
+                            f"• *Live Odds:* {cur_price} (Target: {target_lay})\n"
                             f"─────────────────────────\n"
                             f"👉 *Action:* Lay (Khai) *₹{lay_stake}* @ {cur_price}\n"
-                            f"💰 *Net Profit:* ₹{net_profit} (Equalized)\n\n"
+                            f"💰 *Net Profit:* ₹{net_profit} (Equalized & Risk-Free)\n\n"
                             f"Send `/hedge {t_id} {cur_price}` to settle balance."
                         )
                         send_message(chat_id, msg)
                         mark_alert_sent(alert_key)
 
+                # DEFENSIVE CUT-LOSS LIMIT
                 elif cur_price >= stop_loss and stop_loss > 0:
                     alert_key = f"CUTLOSS_TRIGGER_{t_id}"
                     if not is_alert_sent(alert_key):
@@ -276,21 +262,22 @@ def automated_background_engine():
                             ]]
                         }
                         msg = (
-                            f"🛡️ *CREX RATE DRIFT: CUT-LOSS ALERT*\n\n"
+                            f"🛡️ *MARKET DRIFT: CUT-LOSS ALERT*\n\n"
                             f"• *Match:* {trade['match_title']}\n"
                             f"• *Team:* {trade['team_name']}\n"
                             f"• Odds drifted to: {cur_price} (Limit: {stop_loss})\n"
-                            f"• Salvageable: ₹{salvaged} of ₹{int(trade['back_stake'])}\n\n"
+                            f"• Capital Saved: ₹{salvaged} of ₹{int(trade['back_stake'])}\n\n"
                             f"Tap below or send `/cutloss {t_id} {cur_price}` to preserve capital."
                         )
                         send_message(chat_id, msg, reply_markup=keyboard)
                         mark_alert_sent(alert_key)
 
-        if len(open_trades) < 2:
-            for cm in crex_matches:
-                for team_key, odds in [(cm["team1"], cm["team1_odds"]), (cm["team2"], cm["team2_odds"])]:
+        # 2. Automated Value Swing Signals (2.10–2.50)
+        if len(open_trades) < 2 and live_odds:
+            for m in live_odds:
+                for t_name, odds in [(m["team1"], m["team1_odds"]), (m["team2"], m["team2_odds"])]:
                     if 2.10 <= odds <= 2.50:
-                        alert_key = f"CREX_ENTRY_{cm['id']}_{team_key}_{round(odds, 1)}"
+                        alert_key = f"AUTO_SWING_{m['title']}_{t_name}_{round(odds, 1)}"
                         if not is_alert_sent(alert_key):
                             stake = int(bankroll * 0.05)
                             target_lay = round(odds * 0.70, 2)
@@ -298,30 +285,30 @@ def automated_background_engine():
 
                             inserted = supabase.table("trades").insert({
                                 "chat_id": chat_id,
-                                "match_title": cm["title"],
-                                "team_name": team_key,
+                                "match_title": m["title"],
+                                "team_name": t_name,
                                 "back_odds": odds,
                                 "back_stake": stake,
                                 "target_lay_odds": target_lay,
                                 "stop_loss_odds": stop_loss,
                                 "trade_type": "SWING",
                                 "status": "OPEN" if autopilot else "PENDING",
-                                "entry_reason": f"CREX live swing drift on {team_key} @ {odds}."
+                                "entry_reason": f"Value drift on {t_name} @ {odds}."
                             }).execute().data[0]
 
                             card = (
-                                f"🚨 *AUTOMATIC VALUE ENTRY (CREX RATE)*\n\n"
-                                f"• *Match:* {cm['title']}\n"
-                                f"• *Action:* BACK (Lagai) *{team_key}*\n"
-                                f"• *Live CREX Odds:* {odds}\n"
+                                f"🚨 *LIVE VALUE SWING SIGNAL*\n\n"
+                                f"• *Match:* {m['title']}\n"
+                                f"• *Action:* BACK (Lagai) *{t_name}*\n"
+                                f"• *Market Odds:* {odds}\n"
                                 f"• *Allocated Stake:* ₹{stake} (5% Bankroll)\n"
                                 f"• *Green Book Lay Target:* {target_lay}\n"
                                 f"• *Cut-Loss Limit:* {stop_loss}\n\n"
-                                f"📊 *Reason:* Overreaction dip detected. Mean reversion expected."
+                                f"📊 *Reason:* Target 30% contraction for equalized profit."
                             )
 
                             if autopilot:
-                                send_message(chat_id, card + "\n\n⚡ *Auto-Pilot:* Position logged as OPEN.")
+                                send_message(chat_id, card + "\n\n⚡ *Auto-Pilot:* Trade logged as OPEN.")
                             else:
                                 keyboard = {
                                     "inline_keyboard": [[
@@ -336,7 +323,7 @@ def automated_background_engine():
 
 @app.get("/")
 def health_check():
-    return {"status": "alive", "engine": "Tradex_Quarantined_Gemini_Engine"}
+    return {"status": "alive", "engine": "Tradex_TwoPipe_Engine"}
 
 @app.get("/poll")
 def cron_poll():
@@ -344,7 +331,7 @@ def cron_poll():
     return {"status": "polled", "timestamp": "ok"}
 
 # ===================================================
-# 4. TELEGRAM WEBHOOK COMMANDS
+# TELEGRAM WEBHOOK COMMANDS
 # ===================================================
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
@@ -358,7 +345,7 @@ async def telegram_webhook(request: Request):
         if cb_data.startswith("ACCEPT_"):
             trade_id = int(cb_data.split("_")[1])
             supabase.table("trades").update({"status": "OPEN"}).eq("id", trade_id).execute()
-            send_message(chat_id, f"✅ *Trade #{trade_id} activated.* Live Green Book monitoring is on.")
+            send_message(chat_id, f"✅ *Trade #{trade_id} activated.* Live monitoring active.")
 
         elif cb_data.startswith("SKIP_"):
             trade_id = int(cb_data.split("_")[1])
@@ -424,16 +411,17 @@ async def telegram_webhook(request: Request):
     # /start
     if text == "/start":
         welcome = (
-            "🏏 *Tradex CREX + Gemini AI Trading Engine*\n\n"
-            "• *Schedule Engine:* Powered by Gemini 1.5 Flash (Quarantined Cards)\n"
+            "🏏 *Tradex Two-Pipe Trading Engine*\n\n"
+            "• *Pipe 1:* ESPN Official Core REST API (Clean schedules & scorecards)\n"
+            "• *Pipe 2:* Live In-Play Market Odds Feed\n"
             "• *Virtual Bankroll:* ₹10,000\n"
             "• *Standard Swing (Overs 3-15):* 5% (₹500)\n"
             "• *Death Overs Jackpot (Overs 16-20):* 1% (₹100)\n"
             "• *Max Active Trades:* 2\n\n"
             "*Commands:*\n"
-            "`/upcoming` — Clean WBBL & T20 fixtures\n"
-            "`/live` — Live CREX match odds\n"
-            "`/autopilot` — Toggle auto-trade logging ON/OFF\n"
+            "`/upcoming` — Clean T20 & WBBL fixtures\n"
+            "`/live` — Active match scorecards & odds\n"
+            "`/autopilot` — Toggle auto-trade logging\n"
             "`/trade <Team> <Odds> <Match>` — Manual swing entry\n"
             "`/jackpot <Team> <Odds> <Match>` — Manual micro-stake entry\n"
             "`/hedge <TradeID> <Odds>` — Lock Green Book\n"
@@ -448,99 +436,47 @@ async def telegram_webhook(request: Request):
     if text == "/autopilot":
         current_state = bool(current_user.get("auto_pilot", False))
         new_state = not current_state
-        
         supabase.table("bot_users").update({"auto_pilot": new_state}).eq("chat_id", chat_id).execute()
         
-        if new_state:
-            status_msg = (
-                "⚡ *AUTO-PILOT: ACTIVATED (ON)*\n\n"
-                "• The bot will automatically accept and log in-play value swing entries (2.10–2.50).\n"
-                "• No manual confirmation buttons required.\n\n"
-                "Send `/autopilot` anytime to switch back to manual confirmation."
-            )
-        else:
-            status_msg = (
-                "✋ *AUTO-PILOT: DEACTIVATED (OFF)*\n\n"
-                "• The bot will now prompt you with *[✅ Took Trade]* and *[❌ Skip]* buttons before opening any trade.\n\n"
-                "Send `/autopilot` anytime to turn auto-trade logging back ON."
-            )
-        send_message(chat_id, status_msg)
+        status_label = "ENABLED (Auto-take signals)" if new_state else "DISABLED (Manual Yes/No buttons)"
+        send_message(chat_id, f"⚡ *Auto-Pilot Mode:* {status_label}")
         return {"ok": True}
 
-    # /upcoming
+    # /upcoming (Pipe 1 - ESPN REST API)
     if text == "/upcoming":
-        send_message(chat_id, "🧠 *Analyzing isolated match cards via Gemini AI...*")
-        matches = fetch_upcoming_t20_schedule()
-        if not matches:
-            send_message(chat_id, "No scheduled T20 fixtures found right now. Check back closer to match time!")
+        send_message(chat_id, "📅 *Fetching clean fixtures from ESPN Core API...*")
+        fixtures = fetch_espn_fixtures()
+        upcoming = fixtures.get("upcoming", [])
+        
+        if not upcoming:
+            send_message(chat_id, "No upcoming T20 fixtures found right now.")
         else:
-            report = "🏏 *Upcoming Popular T20 Matches:*\n\n"
-            for m in matches[:8]:
-                title = m.get("title", "")
-                series = m.get("series", "T20 Match")
-                time_str = m.get("status_text", "Scheduled")
-                report += f"• *{title}*\n  🏆 {series}\n  🕒 {time_str}\n\n"
+            report = "🏏 *Upcoming T20 Fixtures (ESPN Core API):*\n\n"
+            for m in upcoming[:8]:
+                report += f"• *{m['title']}*\n  🏆 {m['series']}\n  🕒 {m['status_text']}\n\n"
             send_message(chat_id, report)
         return {"ok": True}
 
-    # /live
+    # /live (Combines Pipe 1 Live Score with Pipe 2 Market Odds)
     if text == "/live":
-        send_message(chat_id, "📡 *Scanning live CREX match odds...*")
-        crex_data = fetch_crex_live_data()
-        if not crex_data:
-            send_message(chat_id, "No live T20 match in progress on CREX right now.\n(Hobart Hurricanes Women vs Melbourne Renegades Women starts today at 1:40 PM IST).\n\nUse `/upcoming` to view the full fixture list.")
+        send_message(chat_id, "📡 *Scanning live scoreboards & market feeds...*")
+        fixtures = fetch_espn_fixtures()
+        live_list = fixtures.get("live", [])
+        odds_list = fetch_live_market_odds()
+
+        if not live_list and not odds_list:
+            send_message(chat_id, "No live T20 match in progress right now.\n(Hobart Hurricanes Women vs Melbourne Renegades Women starts today at 1:40 PM IST).\n\nUse `/upcoming` to view the full fixture list.")
             return {"ok": True}
 
-        report = "🏏 *Live CREX Matches & Odds:*\n\n"
-        for m in crex_data:
+        report = "🏏 *Live T20 Matches:*\n\n"
+        for m in live_list[:5]:
             report += (
                 f"• *{m['title']}* ({m['series']})\n"
-                f"  {m['team1']}: {m['team1_odds'] if m['team1_odds'] > 0 else 'N/A'}\n"
-                f"  {m['team2']}: {m['team2_odds'] if m['team2_odds'] > 0 else 'N/A'}\n"
-                f"  Status: {m['status']}\n\n"
+                f"  {m['team1']}: {m['team1_score']}\n"
+                f"  {m['team2']}: {m['team2_score']}\n"
+                f"  Status: {m['status_text']}\n\n"
             )
         send_message(chat_id, report)
-        return {"ok": True}
-
-    # /calc
-    if text.startswith("/calc"):
-        parts = text.split()
-        if len(parts) != 5:
-            send_message(chat_id, "⚠️ *Format:* `/calc <Runs> <Wickets> <Overs> <Target>`\n*Example:* `/calc 110 3 13.2 165`")
-            return {"ok": True}
-
-        try:
-            r = int(parts[1])
-            w = int(parts[2])
-            ov = float(parts[3])
-            target = int(parts[4])
-        except ValueError:
-            send_message(chat_id, "Please enter valid numbers.")
-            return {"ok": True}
-
-        prob, odds = calculate_internal_t20_odds(r, w, ov, target)
-        completed_ov = int(ov)
-        balls_done = completed_ov * 6 + int(round((ov - completed_ov) * 10))
-        balls_left = max(1, 120 - balls_done)
-        rrr = round(((target - r) / balls_left) * 6, 2)
-
-        card = (
-            f"🧠 *T20 QUANTITATIVE MODEL*\n\n"
-            f"• *State:* {r}/{w} in {ov} overs ({balls_left} balls left)\n"
-            f"• *Target:* {target} (Needs {target - r} runs)\n"
-            f"• *Required Run Rate:* {rrr} RPO\n"
-            f"─────────────────────────\n"
-            f"📊 *Chasing Win Probability:* {prob}%\n"
-            f"📈 *Synthetic Decimal Odds:* {odds}\n\n"
-        )
-        if ov >= 16.0 and odds >= 4.50:
-            card += "🎰 *Signal:* Death Overs Jackpot Candidate (1% Micro-Stake)!"
-        elif 2.10 <= odds <= 2.50 and ov < 16.0:
-            card += "⚡ *Signal:* Standard Swing Zone (5% Stake)!"
-        else:
-            card += "⚪ *Signal:* Normal variance. Standing by."
-
-        send_message(chat_id, card)
         return {"ok": True}
 
     # /balance
