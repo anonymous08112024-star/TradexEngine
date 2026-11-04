@@ -135,13 +135,9 @@ def fetch_crex_live_data():
     return matches
 
 # ===================================================
-# 2. GEMINI AI SCHEDULE ENGINE (100% CLEAN EXTRACTION)
+# 2. GEMINI AI SCHEDULE ENGINE + FAILSAFE
 # ===================================================
 def fetch_upcoming_t20_schedule():
-    """
-    Grabs the raw schedule text from CREX and lets Gemini 2.5 Flash 
-    extract clean match pairs, tournament titles, and start times.
-    """
     url = "https://crex.com/schedule"
     raw_text = ""
     try:
@@ -150,45 +146,78 @@ def fetch_upcoming_t20_schedule():
             soup = BeautifulSoup(resp.text, "html.parser")
             raw_text = soup.get_text(separator="\n")
     except Exception as e:
-        print(f"CREX fetch error: {e}")
+        print(f"CREX schedule fetch error: {e}")
 
-    if not raw_text or not GEMINI_API_KEY:
-        return []
+    # Step A: Try Gemini AI parsing if key is available
+    if raw_text and GEMINI_API_KEY:
+        try:
+            # Use 15,000 characters to cover full fixture cards
+            relevant_text = raw_text[:15000]
+            gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            
+            prompt = (
+                "Extract all upcoming scheduled T20 cricket matches (specifically WBBL, BBL, IPL, CSA T20, etc.) "
+                "from this raw text. Return ONLY a valid JSON list of objects with these exact keys:\n"
+                "- 'title': Full team names (e.g. 'Hobart Hurricanes Women vs Melbourne Renegades Women')\n"
+                "- 'series': Tournament name (e.g. 'Women\\'s Big Bash League 2026')\n"
+                "- 'status_text': Time or date (e.g. 'Tomorrow, 1:40 PM')\n\n"
+                "Rules:\n"
+                "1. DO NOT put ordinals like '9th', '3rd', or time strings as team names.\n"
+                "2. Exclude ODI, Test, and already finished matches.\n\n"
+                f"TEXT:\n{relevant_text}"
+            )
 
-    # Clean text to send to Gemini
-    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-    cleaned_chunk = "\n".join(lines[:350])  # Send relevant schedule portion
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"response_mime_type": "application/json"}
+            }
 
-    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    
-    prompt = (
-        "Extract all upcoming scheduled T20 cricket matches (specifically WBBL, BBL, IPL, CSA T20, International T20s) "
-        "from this raw text. Return ONLY a valid JSON list of objects with these exact keys:\n"
-        "- 'title': (e.g. 'Hobart Hurricanes Women vs Melbourne Renegades Women')\n"
-        "- 'series': (e.g. 'Women\\'s Big Bash League 2026')\n"
-        "- 'status_text': (e.g. 'Tomorrow, 1:40 PM' or match time)\n\n"
-        "Rules:\n"
-        "1. Never put ordinals like '9th' or '3rd' or times as team names.\n"
-        "2. Exclude ODI, Test, and already completed matches.\n\n"
-        f"TEXT:\n{cleaned_chunk}"
-    )
+            res = requests.post(gemini_url, json=payload, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                raw_json = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                matches = json.loads(raw_json)
+                if isinstance(matches, list) and len(matches) > 0:
+                    return matches
+            else:
+                print(f"Gemini API returned status {res.status_code}: {res.text}")
+        except Exception as ge:
+            print(f"Gemini processing fallback triggered: {ge}")
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"response_mime_type": "application/json"}
-    }
+    # Step B: Fallback Regex Matcher if Gemini encounters any issue
+    upcoming = []
+    seen = set()
+    if raw_text:
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        for i in range(len(lines)):
+            curr = lines[i].upper()
+            if any(kw in curr for kw in ["WBBL", "BBL", "T20", "IPL", "WPL", "CSA T20"]) and not any(ex in curr for ex in ["ODI", "TEST", "LIST A"]):
+                series_name = lines[i].lstrip(", ")
+                candidates = []
+                for b in range(max(0, i - 8), i):
+                    cand = lines[b].lstrip(", ")
+                    if 3 < len(cand) < 32 and not any(tk in cand.upper() for tk in ["STARTS", "AM", "PM", "LIVE", "2026", "T20", "CRICKET", "SCHEDULE", "SERIES"]):
+                        if not re.search(r"^\d+(ST|ND|RD|TH)$", cand.upper()):
+                            candidates.append(cand)
+                
+                if len(candidates) >= 2:
+                    t1, t2 = candidates[-2], candidates[-1]
+                    if t1.lower() != t2.lower():
+                        time_cand = "Scheduled"
+                        for f in range(i + 1, min(len(lines), i + 4)):
+                            if any(tk in lines[f].upper() for tk in ["AM", "PM", "STARTS", "TOMORROW", "TODAY"]):
+                                time_cand = lines[f]
+                                break
+                        m_title = f"{t1} vs {t2}"
+                        if m_title not in seen:
+                            seen.add(m_title)
+                            upcoming.append({
+                                "title": m_title,
+                                "series": series_name,
+                                "status_text": time_cand
+                            })
 
-    try:
-        res = requests.post(gemini_url, json=payload, timeout=10)
-        data = res.json()
-        raw_json_str = data["candidates"][0]["content"]["parts"][0]["text"]
-        matches = json.loads(raw_json_str)
-        if isinstance(matches, list):
-            return matches
-    except Exception as e:
-        print(f"Gemini API parse error: {e}")
-
-    return []
+    return upcoming
 
 # ===================================================
 # 3. BACKGROUND CRON ENGINE (/poll)
@@ -381,7 +410,6 @@ async def telegram_webhook(request: Request):
     chat_id = msg["chat"]["id"]
     text = msg.get("text", "").strip()
 
-    # Ensure user exists in database
     user_res = supabase.table("bot_users").select("*").eq("chat_id", chat_id).execute().data
     if not user_res:
         new_user = {
@@ -399,13 +427,13 @@ async def telegram_webhook(request: Request):
     if text == "/start":
         welcome = (
             "🏏 *Tradex CREX + Gemini AI Trading Engine*\n\n"
-            "• *Schedule Engine:* Powered by Gemini 2.5 Flash\n"
+            "• *Schedule Engine:* Powered by Gemini 1.5 Flash\n"
             "• *Virtual Bankroll:* ₹10,000\n"
             "• *Standard Swing (Overs 3-15):* 5% (₹500)\n"
             "• *Death Overs Jackpot (Overs 16-20):* 1% (₹100)\n"
             "• *Max Active Trades:* 2\n\n"
             "*Commands:*\n"
-            "`/upcoming` — Clean WBBL & T20 fixtures via Gemini AI\n"
+            "`/upcoming` — Clean WBBL & T20 fixtures\n"
             "`/live` — Live CREX match odds\n"
             "`/autopilot` — Toggle auto-trade logging ON/OFF\n"
             "`/trade <Team> <Odds> <Match>` — Manual swing entry\n"
@@ -418,7 +446,7 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, welcome)
         return {"ok": True}
 
-    # /autopilot (Defensive & Clear Feedback)
+    # /autopilot
     if text == "/autopilot":
         current_state = bool(current_user.get("auto_pilot", False))
         new_state = not current_state
@@ -441,12 +469,12 @@ async def telegram_webhook(request: Request):
         send_message(chat_id, status_msg)
         return {"ok": True}
 
-    # /upcoming (Gemini-Powered)
+    # /upcoming
     if text == "/upcoming":
         send_message(chat_id, "🧠 *Analyzing CREX schedule via Gemini AI...*")
         matches = fetch_upcoming_t20_schedule()
         if not matches:
-            send_message(chat_id, "No scheduled T20 fixtures found or unable to parse schedule.")
+            send_message(chat_id, "No scheduled T20 fixtures found right now. Check back closer to match time!")
         else:
             report = "🏏 *Upcoming Popular T20 Matches:*\n\n"
             for m in matches[:8]:
